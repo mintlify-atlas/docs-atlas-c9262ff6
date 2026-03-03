@@ -1,0 +1,139 @@
+{
+  "projectType": "general",
+  "projectName": "Across Protocol Contracts",
+  "projectDescription": "Smart contracts for Across Protocol cross-chain bridge with hub-and-spoke architecture for fast token transfers between networks.",
+  "theme": "aspen",
+  "primaryColor": "#6CF9D8",
+  "lightColor": "#6CF9D8",
+  "darkColor": "#44D9B6",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/hub-and-spoke",
+              "concepts/protocol-flow",
+              "concepts/roles"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/deployment",
+              "guides/upgrades",
+              "guides/verification"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Smart Contracts",
+        "groups": [
+          {
+            "group": "Core Contracts",
+            "pages": [
+              "contracts/hubpool",
+              "contracts/spokepool"
+            ]
+          },
+          {
+            "group": "Chain Adapters",
+            "pages": [
+              "contracts/adapters/overview",
+              "contracts/adapters/arbitrum",
+              "contracts/adapters/optimism",
+              "contracts/adapters/polygon",
+              "contracts/adapters/solana"
+            ]
+          },
+          {
+            "group": "SpokePool Variants",
+            "pages": [
+              "contracts/spokepools/ethereum",
+              "contracts/spokepools/arbitrum",
+              "contracts/spokepools/optimism",
+              "contracts/spokepools/polygon",
+              "contracts/spokepools/zksync",
+              "contracts/spokepools/universal"
+            ]
+          },
+          {
+            "group": "Supporting Contracts",
+            "pages": [
+              "contracts/supporting/config-store",
+              "contracts/supporting/bond-token",
+              "contracts/supporting/merkle-lib"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Solana Programs",
+        "groups": [
+          {
+            "group": "SVM Programs",
+            "pages": [
+              "solana/overview",
+              "solana/svm-spoke",
+              "solana/multicall-handler",
+              "solana/sponsored-cctp"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Development",
+        "groups": [
+          {
+            "group": "Testing",
+            "pages": [
+              "development/testing",
+              "development/foundry",
+              "development/hardhat"
+            ]
+          },
+          {
+            "group": "Scripts & Tools",
+            "pages": [
+              "development/scripts",
+              "development/slither"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Hub-and-spoke architecture with HubPool on Ethereum L1",
+    "Cross-chain token transfers via SpokePools on multiple chains",
+    "Optimistic verification using UMA Oracle for dispute resolution",
+    "UUPS upgradeable proxy pattern for SpokePools",
+    "Chain-specific adapters for 20+ networks (EVM and Solana)",
+    "Merkle-based bundle validation for relayer refunds",
+    "Cross-chain ownership and governance"
+  ],
+  "publicApiSurface": [
+    "HubPool.proposeRootBundle()",
+    "HubPool.executeRootBundle()",
+    "HubPool.disputeRootBundle()",
+    "SpokePool.depositV3()",
+    "SpokePool.fillRelay()",
+    "SpokePool.executeRelayerRefundLeaf()",
+    "SpokePool.executeSlowRelayLeaf()",
+    "Arbitrum_Adapter.relayMessage()",
+    "Optimism_Adapter.relayMessage()",
+    "Polygon_Adapter.relayMessage()",
+    "Solana_Adapter.relayMessage()"
+  ]
+}
