@@ -1,122 +1,129 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "Across Protocol Contracts",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#6CF9D8",
+    "light": "#6CF9D8",
+    "dark": "#44D9B6"
   },
-  "favicon": "/favicon.svg",
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/across-protocol/contracts"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/across-protocol/contracts"
+    }
+  },
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "Documentation",
         "groups": [
           {
-            "group": "Getting started",
+            "group": "Get Started",
             "pages": [
-              "index",
-              "quickstart",
-              "development"
+              "introduction",
+              "quickstart"
             ]
           },
           {
-            "group": "Customization",
+            "group": "Core Concepts",
             "pages": [
-              "essentials/settings",
-              "essentials/navigation"
+              "concepts/architecture",
+              "concepts/hub-and-spoke",
+              "concepts/protocol-flow",
+              "concepts/roles"
             ]
           },
           {
-            "group": "Writing content",
+            "group": "Guides",
             "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
-            ]
-          },
-          {
-            "group": "AI tools",
-            "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
+              "guides/deployment",
+              "guides/upgrades",
+              "guides/verification"
             ]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "Smart Contracts",
         "groups": [
           {
-            "group": "API documentation",
+            "group": "Core Contracts",
             "pages": [
-              "api-reference/introduction"
+              "contracts/hubpool",
+              "contracts/spokepool"
             ]
           },
           {
-            "group": "Endpoint examples",
+            "group": "Chain Adapters",
             "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
+              "contracts/adapters/overview",
+              "contracts/adapters/arbitrum",
+              "contracts/adapters/optimism",
+              "contracts/adapters/polygon",
+              "contracts/adapters/solana"
+            ]
+          },
+          {
+            "group": "SpokePool Variants",
+            "pages": [
+              "contracts/spokepools/ethereum",
+              "contracts/spokepools/arbitrum",
+              "contracts/spokepools/optimism",
+              "contracts/spokepools/polygon",
+              "contracts/spokepools/zksync",
+              "contracts/spokepools/universal"
+            ]
+          },
+          {
+            "group": "Supporting Contracts",
+            "pages": [
+              "contracts/supporting/config-store",
+              "contracts/supporting/bond-token",
+              "contracts/supporting/merkle-lib"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Solana Programs",
+        "groups": [
+          {
+            "group": "SVM Programs",
+            "pages": [
+              "solana/overview",
+              "solana/svm-spoke",
+              "solana/multicall-handler",
+              "solana/sponsored-cctp"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Development",
+        "groups": [
+          {
+            "group": "Testing",
+            "pages": [
+              "development/testing",
+              "development/foundry",
+              "development/hardhat"
+            ]
+          },
+          {
+            "group": "Scripts & Tools",
+            "pages": [
+              "development/scripts",
+              "development/slither"
             ]
           }
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
+    ]
   }
 }

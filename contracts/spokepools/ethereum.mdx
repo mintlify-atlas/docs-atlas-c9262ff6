@@ -1,0 +1,115 @@
+---
+title: "Ethereum_SpokePool"
+description: "L1 SpokePool variant deployed on Ethereum mainnet"
+---
+
+## Overview
+
+The `Ethereum_SpokePool` is the L1-specific SpokePool variant deployed on Ethereum mainnet. Unlike L2 SpokePools that bridge tokens across chains, this contract facilitates L2→L1 transfers by directly transferring tokens to the withdrawal recipient (HubPool).
+
+**Contract:** `contracts/Ethereum_SpokePool.sol`
+
+## Key Characteristics
+
+- **Same-chain deployment**: Deployed on the same network as HubPool (Ethereum L1)
+- **Direct ownership**: Owned directly by HubPool via `OwnableUpgradeable`
+- **No cross-chain bridging**: Uses simple ERC20 transfers instead of bridge contracts
+- **No OFT messaging**: Does not use LayerZero OFT; both `oftDstEid` and `oftFeeCap` set to 0
+
+## Inheritance
+
+```solidity
+contract Ethereum_SpokePool is SpokePool, OwnableUpgradeable
+```
+
+- Inherits base `SpokePool` functionality
+- Uses `OwnableUpgradeable` for simple admin control (no cross-chain verification needed)
+
+## Constructor
+
+```solidity
+constructor(
+    address _wrappedNativeTokenAddress,
+    uint32 _depositQuoteTimeBuffer,
+    uint32 _fillDeadlineBuffer
+)
+    SpokePool(
+        _wrappedNativeTokenAddress,
+        _depositQuoteTimeBuffer,
+        _fillDeadlineBuffer,
+        // Ethereum_SpokePool does not use OFT messaging
+        0, // oftDstEid
+        0  // oftFeeCap
+    )
+```
+
+**Parameters:**
+- `_wrappedNativeTokenAddress`: Address of WETH on Ethereum
+- `_depositQuoteTimeBuffer`: Max age for deposit quote timestamps
+- `_fillDeadlineBuffer`: Max future offset for fill deadlines
+
+## Initialization
+
+```solidity
+function initialize(
+    uint32 _initialDepositId,
+    address _withdrawalRecipient
+) public initializer
+```
+
+**Parameters:**
+- `_initialDepositId`: Starting deposit nonce (0 for new deployments, incremented for re-deployments to avoid relay hash collisions)
+- `_withdrawalRecipient`: Recipient of token withdrawals (typically the HubPool address)
+
+**Note:** `crossDomainAdmin` parameter is unused on Ethereum and set equal to `_withdrawalRecipient`.
+
+## Admin Verification
+
+### `_requireAdminSender()`
+
+```solidity
+function _requireAdminSender() internal override onlyOwner {}
+```
+
+**Implementation:** Uses OpenZeppelin's `onlyOwner` modifier to verify the caller is the contract owner (HubPool).
+
+**Why it's different:** Since this SpokePool is deployed on the same chain as HubPool, no cross-chain message verification is needed. The owner can call admin functions directly.
+
+## Token Bridging
+
+### `_bridgeTokensToHubPool()`
+
+```solidity
+function _bridgeTokensToHubPool(
+    uint256 amountToReturn,
+    address l2TokenAddress
+) internal override {
+    IERC20Upgradeable(l2TokenAddress).safeTransfer(
+        withdrawalRecipient,
+        amountToReturn
+    );
+}
+```
+
+**Implementation:** Performs a simple ERC20 transfer to the `withdrawalRecipient` (HubPool).
+
+**Why it's different:** No canonical bridge interaction required since tokens are already on L1. This is the simplest implementation among all SpokePool variants.
+
+## Unique Features
+
+1. **Simplest variant**: Minimal code due to same-chain deployment
+2. **Direct transfers**: No bridge contracts or cross-chain messages
+3. **Standard ownership**: Uses standard `Ownable` pattern instead of cross-domain admin verification
+4. **L2→L1 facilitator**: Primary purpose is to receive tokens bridged from L2s and transfer them to HubPool
+
+## Architecture Notes
+
+- The Ethereum_SpokePool is owned by the HubPool contract
+- Admin functions are called directly by HubPool without cross-chain relaying
+- This contract serves as the final destination for tokens bridged from L2 SpokePools
+- The `crossDomainAdmin` variable exists for interface compatibility but is unused
+
+## Related Contracts
+
+- [SpokePool](/contracts/spokepool) - Base contract
+- [HubPool](/contracts/hubpool) - Owner and withdrawal recipient

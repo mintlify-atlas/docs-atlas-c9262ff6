@@ -1,0 +1,232 @@
+---
+title: "BondToken"
+description: "Permissioned bond token for data worker proposals"
+---
+
+## Overview
+
+The `BondToken` contract (Across Bond Token, or ABT) is a specialized WETH9-based token that adds permissioning controls to protect the HubPool from unauthorized root bundle proposals. It serves as the required bond token for data workers submitting proposals.
+
+**Location**: `contracts/BondToken.sol`  
+**Symbol**: ABT (Across Bond Token)  
+**Based on**: WETH9 (Wrapped Ether)
+
+## Purpose
+
+BondToken dramatically reduces the attack surface of the HubPool by:
+
+- Requiring explicit approval before addresses can submit root bundle proposals
+- Preventing unauthorized actors from staking bonds and proposing malicious bundles
+- Maintaining permissionless dispute capabilities (anyone can still dispute)
+- Providing a governance-controlled allowlist for proposers
+
+## Key Design Features
+
+### WETH9 Compatibility
+
+BondToken extends WETH9, providing:
+- 1:1 backing with Ether
+- Standard ERC-20 interface
+- Deposit and withdrawal functions
+- Compatibility with existing DeFi tooling
+
+### Selective Transfer Restrictions
+
+Unlike typical tokens, BondToken only restricts transfers **to the HubPool** and only for **unauthorized proposers**. All other transfers remain permissionless.
+
+### Dispute Preservation
+
+The permissioning does **not** affect dispute capabilities—any address can transfer ABT to the HubPool to dispute a bundle, maintaining the protocol's decentralized security model.
+
+## Contract Structure
+
+```solidity
+contract BondToken is WETH9, Ownable {
+    using Address for address;
+    
+    // Immutable reference to HubPool
+    ExtendedHubPoolInterface public immutable HUB_POOL;
+    
+    // Allowlist of addresses permitted to propose bundles
+    mapping(address => bool) public proposers;
+    
+    event ProposerModified(address proposer, bool enabled);
+}
+```
+
+## Core Functions
+
+### Constructor
+
+Initializes the BondToken with a reference to the HubPool.
+
+```solidity
+constructor(ExtendedHubPoolInterface _hubPool) {
+    name = "Across Bond Token";
+    symbol = "ABT";
+    HUB_POOL = _hubPool;
+}
+```
+
+**Parameters**:
+- `_hubPool`: Address of the target HubPool contract
+
+### setProposer
+
+Enables or disables an address as an allowed proposer.
+
+```solidity
+function setProposer(
+    address proposer,
+    bool enabled
+) external onlyOwner
+```
+
+**Parameters**:
+- `proposer`: The address to modify
+- `enabled`: `true` to allow proposing, `false` to revoke
+
+**Access**: Only callable by contract owner (governance)
+
+**Events**: Emits `ProposerModified(proposer, enabled)`
+
+**Example**:
+```solidity
+// Add a data worker as approved proposer
+bondToken.setProposer(0x123..., true);
+
+// Revoke proposer access
+bondToken.setProposer(0x123..., false);
+```
+
+### transferFrom
+
+Overrides WETH9's `transferFrom` to add permissioning logic.
+
+```solidity
+function transferFrom(
+    address src,
+    address dst,
+    uint256 amt
+) public override returns (bool)
+```
+
+**Parameters**:
+- `src`: Source address
+- `dst`: Destination address
+- `amt`: Amount to transfer
+
+**Returns**: `true` on success
+
+**Logic**:
+```solidity
+if (dst == address(HUB_POOL)) {
+    require(
+        proposers[src] || HUB_POOL.rootBundleProposal().proposer != src,
+        "Transfer not permitted"
+    );
+}
+return super.transferFrom(src, dst, amt);
+```
+
+**Transfer is blocked if**:
+1. Destination is the HubPool, **AND**
+2. Source is not an approved proposer, **AND**
+3. Source is the current proposer of an active bundle
+
+This prevents unauthorized addresses from locking bond tokens in the HubPool during proposal submission.
+
+## How It Works
+
+### Proposal Flow with BondToken
+
+1. **Data Worker Approval**: Governance calls `setProposer(dataWorker, true)`
+2. **Depositing Ether**: Data worker deposits ETH to receive ABT:
+   ```solidity
+   bondToken.deposit{value: bondAmount}();
+   ```
+3. **Approval**: Data worker approves HubPool to spend ABT:
+   ```solidity
+   bondToken.approve(address(hubPool), bondAmount);
+   ```
+4. **Proposal Submission**: Data worker calls `HubPool.proposeRootBundle()`:
+   - HubPool calls `bondToken.transferFrom(dataWorker, hubPool, bondAmount)`
+   - BondToken checks if data worker is in `proposers` mapping
+   - If authorized, transfer succeeds and proposal is recorded
+
+### Dispute Flow (Permissionless)
+
+Any address can dispute, regardless of proposer status:
+
+1. Disputer deposits ETH to receive ABT
+2. Disputer approves HubPool
+3. Disputer calls `HubPool.disputeRootBundle()`
+4. BondToken allows transfer because disputer is not the current proposer (the check `HUB_POOL.rootBundleProposal().proposer != src` passes)
+
+## Security Considerations
+
+### HubPool State Dependency
+
+The `transferFrom` verification relies on the HubPool's internal state ordering:
+
+```solidity
+require(
+    proposers[src] || HUB_POOL.rootBundleProposal().proposer != src,
+    "Transfer not permitted"
+);
+```
+
+This check depends on HubPool calling `bondToken.safeTransferFrom()` **after** updating `proposedRootBundle.proposer`. Changing the order of HubPool operations could invalidate this verification.
+
+### Attack Surface Reduction
+
+Without BondToken, any address with sufficient capital could:
+1. Stake a bond
+2. Propose a malicious root bundle
+3. Force the protocol into a dispute/resolution cycle
+
+With BondToken, only governance-approved addresses can submit proposals, dramatically reducing the risk of spam or malicious proposals.
+
+### Governance Control
+
+The `proposers` mapping is controlled by the contract owner (governance), ensuring:
+- Only trusted data workers can propose
+- Compromised data workers can be quickly removed
+- Emergency response to security incidents
+
+## Integration with HubPool
+
+HubPool is configured to use BondToken as the required bond token:
+
+```solidity
+// In HubPool deployment
+hubPool.setBondToken(address(bondToken));
+```
+
+When a data worker calls `proposeRootBundle()`, HubPool attempts:
+```solidity
+bondToken.safeTransferFrom(msg.sender, address(this), bondAmount);
+```
+
+This transfer only succeeds if the data worker is an approved proposer.
+
+## Staking and Bonding
+
+### Bond Requirements
+
+- Data workers must hold sufficient ABT to cover the bond amount
+- Bond amounts are configurable per proposal based on protocol parameters
+- Bonds are returned after successful execution or dispute resolution
+
+### Slashing
+
+If a proposal is disputed and found invalid:
+- Data worker's bond is slashed
+- Slashed funds are distributed to the disputer as a reward
+- The data worker may be removed from the proposers list
+
+## Related Contracts
+
+- **HubPool**: Consumes BondToken for proposal bonds
+- **WETH9**: Base implementation for wrapping ETH
+- **Optimistic Oracle (UMA)**: Resolves disputes over invalid proposals

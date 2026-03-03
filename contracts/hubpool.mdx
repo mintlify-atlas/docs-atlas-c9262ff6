@@ -1,0 +1,525 @@
+---
+title: "HubPool"
+description: "Central L1 contract managing liquidity, root bundle validation, and cross-chain coordination"
+---
+
+## Overview
+
+The HubPool is the central contract deployed on Ethereum L1 that houses token liquidity for all SpokePools across supported chains. It acts as the cross-chain administrator and owner of all L2 SpokePools, coordinating governance actions and pool rebalances.
+
+**Contract Location:** `contracts/HubPool.sol:41`
+
+<Warning>
+This contract should be deprecated by the year 2106, at which point uint32 timestamps will roll over. Fee calculations will become incorrect when multiplying by negative time deltas. Before this date, the contract should be paused from accepting new root bundles and all LP tokens should be disabled.
+</Warning>
+
+## Core Responsibilities
+
+- **Liquidity Management**: Stores L1 token liquidity provided by LPs who earn fees for funding cross-chain relays
+- **Root Bundle Validation**: Accepts and validates merkle root bundles proposed by data workers using UMA's Optimistic Oracle
+- **Pool Rebalancing**: Sends tokens to SpokePools via canonical bridges to refund relayers and fulfill slow relays
+- **Cross-Chain Administration**: Relays admin function calls to SpokePools on all supported chains
+- **Protocol Fee Collection**: Captures a percentage of LP fees for protocol development
+
+## Architecture
+
+### Inheritance
+
+```solidity
+contract HubPool is 
+    HubPoolInterface, 
+    Testable, 
+    Lockable, 
+    MultiCaller, 
+    Ownable
+```
+
+### Key Dependencies
+
+- **UMA Optimistic Oracle**: For dispute resolution on root bundles
+- **Finder**: UMA's service registry for locating oracle and whitelist contracts
+- **LP Token Factory**: Deploys ERC20 LP tokens for each enabled L1 token
+- **Chain Adapters**: Stateless contracts for bridging tokens/messages to each L2
+
+## Storage Variables
+
+<ParamField path="rootBundleProposal" type="RootBundle">
+  Currently active root bundle proposal. Only one can exist at a time. Contains pool rebalance, relayer refund, and slow relay merkle roots along with proposal metadata.
+</ParamField>
+
+<ParamField path="pooledTokens" type="mapping(address => PooledToken)">
+  Maps L1 token addresses to their pool state including LP token address, enabled status, reserves, and undistributed fees.
+  
+  **PooledToken struct fields:**
+  - `lpToken`: ERC20 LP token given to liquidity providers
+  - `isEnabled`: Whether accepting new deposits
+  - `lastLpFeeUpdate`: Timestamp of last fee distribution update
+  - `utilizedReserves`: Funds sent to SpokePools awaiting return (can be negative)
+  - `liquidReserves`: Available funds in contract
+  - `undistributedLpFees`: Fees accumulated but not yet distributed to LPs
+</ParamField>
+
+<ParamField path="crossChainContracts" type="mapping(uint256 => CrossChainContract)">
+  Maps chain ID to adapter and SpokePool addresses for cross-chain communication.
+  
+  **CrossChainContract struct:**
+  - `adapter`: Address of chain adapter for bridging (called via delegatecall)
+  - `spokePool`: Address of SpokePool on destination chain
+</ParamField>
+
+<ParamField path="bondToken" type="IERC20">
+  Token used for bonding when proposing root bundles. Slashed if bundle is disputed and found invalid.
+</ParamField>
+
+<ParamField path="bondAmount" type="uint256">
+  Amount of bond token required to propose a root bundle. Set to bond token final fee + configurable bond.
+</ParamField>
+
+<ParamField path="liveness" type="uint32">
+  Challenge period duration in seconds. Defaults to 7200 (2 hours). Bundles can be disputed only during this window.
+</ParamField>
+
+<ParamField path="lpFeeRatePerSecond" type="uint256">
+  Interest rate for distributing LP fees. Set to 0.0000015e18 by default, paying out full fees in ~7.72 days.
+</ParamField>
+
+<ParamField path="protocolFeeCapturePct" type="uint256">
+  Percentage of LP fees captured by protocol (0-1e18 scale).
+</ParamField>
+
+## Key Functions
+
+### proposeRootBundle
+
+Publishes a new root bundle containing merkle roots for pool rebalances, relayer refunds, and slow relays. Proposer stakes a bond that can be slashed if invalid.
+
+```solidity
+function proposeRootBundle(
+    uint256[] calldata bundleEvaluationBlockNumbers,
+    uint8 poolRebalanceLeafCount,
+    bytes32 poolRebalanceRoot,
+    bytes32 relayerRefundRoot,
+    bytes32 slowRelayRoot
+) public nonReentrant noActiveRequests unpaused
+```
+
+<ParamField path="bundleEvaluationBlockNumbers" type="uint256[]">
+  Latest block number for each chain at bundle evaluation time. Used by off-chain validators to verify bundle correctness.
+</ParamField>
+
+<ParamField path="poolRebalanceLeafCount" type="uint8">
+  Number of leaves in the pool rebalance merkle tree. Must be > 0. Max is number of whitelisted chains.
+</ParamField>
+
+<ParamField path="poolRebalanceRoot" type="bytes32">
+  Merkle root of pool rebalance leaves that instruct token transfers from HubPool to SpokePools.
+</ParamField>
+
+<ParamField path="relayerRefundRoot" type="bytes32">
+  Merkle root published to SpokePools for relayers to claim refunds via inclusion proofs.
+</ParamField>
+
+<ParamField path="slowRelayRoot" type="bytes32">
+  Merkle root published to SpokePools for executing slow relay fulfillments.
+</ParamField>
+
+**Requirements:**
+- Caller must approve this contract to spend `bondAmount` of `bondToken`
+- No active bundle proposal exists (all previous leaves executed)
+- Contract is not paused
+- `poolRebalanceLeafCount > 0`
+
+**Emits:** `ProposeRootBundle(challengePeriodEndTimestamp, poolRebalanceLeafCount, bundleEvaluationBlockNumbers, poolRebalanceRoot, relayerRefundRoot, slowRelayRoot, proposer)`
+
+---
+
+### executeRootBundle
+
+Executes a pool rebalance leaf after the challenge period. Sends tokens to a SpokePool and relays refund/slow relay roots if this is the first leaf for that chain.
+
+```solidity
+function executeRootBundle(
+    uint256 chainId,
+    uint256 groupIndex,
+    uint256[] memory bundleLpFees,
+    int256[] memory netSendAmounts,
+    int256[] memory runningBalances,
+    uint8 leafId,
+    address[] memory l1Tokens,
+    bytes32[] calldata proof
+) public nonReentrant unpaused
+```
+
+<ParamField path="chainId" type="uint256">
+  Destination chain ID where tokens will be sent.
+</ParamField>
+
+<ParamField path="groupIndex" type="uint256">
+  Organizational index. If 0, this leaf will also relay merkle roots to the SpokePool. Only one leaf per chain should have groupIndex == 0.
+</ParamField>
+
+<ParamField path="bundleLpFees" type="uint256[]">
+  Total LP fees per token in this bundle for all relays. Parallel array to l1Tokens.
+</ParamField>
+
+<ParamField path="netSendAmounts" type="int256[]">
+  Amount to send to (+) or receive from (-) the SpokePool for each token. Parallel array to l1Tokens.
+</ParamField>
+
+<ParamField path="runningBalances" type="int256[]">
+  Running balance tracking between HubPool and SpokePool. Positive means HubPool owes SpokePool. Parallel array to l1Tokens.
+</ParamField>
+
+<ParamField path="leafId" type="uint8">
+  Unique identifier for this leaf in the merkle tree (0-255).
+</ParamField>
+
+<ParamField path="l1Tokens" type="address[]">
+  Array of L1 token addresses corresponding to the fee/amount arrays.
+</ParamField>
+
+<ParamField path="proof" type="bytes32[]">
+  Merkle inclusion proof for this leaf.
+</ParamField>
+
+**Requirements:**
+- Current time > challenge period end timestamp
+- Leaf not already claimed
+- Valid merkle proof
+- Pool rebalance routes configured for all (l1Token, chainId) pairs
+- Cross-chain contracts (adapter, spokePool) set for chainId
+
+**Effects:**
+- Sends tokens to SpokePool via chain adapter (if netSendAmount > 0)
+- Updates utilized/liquid reserves for L1 tokens
+- Allocates LP and protocol fees
+- Relays relayer refund and slow relay roots to SpokePool (if groupIndex == 0)
+- Returns bond to proposer after last leaf executed
+
+**Emits:** `RootBundleExecuted(groupIndex, leafId, chainId, l1Tokens, bundleLpFees, netSendAmounts, runningBalances, caller)`
+
+---
+
+### disputeRootBundle
+
+Disputes the current root bundle proposal by staking a bond and sending the dispute to UMA's Optimistic Oracle. Can only be called during the challenge period.
+
+```solidity
+function disputeRootBundle() public nonReentrant zeroOptimisticOracleApproval
+```
+
+**Requirements:**
+- Current time ≤ challenge period end timestamp
+- Caller must approve this contract to spend `bondAmount` of `bondToken`
+- Bond amount > final fee (otherwise bundle is canceled instead)
+
+**Effects:**
+- Requests price from Optimistic Oracle with proposer's bond
+- Immediately disputes the price request with disputer's bond
+- Deletes root bundle proposal, allowing new proposal
+- If dispute succeeds, disputer receives both bonds; if fails, proposer receives both
+
+**Emits:** `RootBundleDisputed(disputer, requestTime)`
+
+---
+
+### relaySpokePoolAdminFunction
+
+Sends an admin function call to a SpokePool on another chain. Only callable by owner. Used for all governance actions on SpokePools.
+
+```solidity
+function relaySpokePoolAdminFunction(
+    uint256 chainId,
+    bytes memory functionData
+) public onlyOwner nonReentrant
+```
+
+<ParamField path="chainId" type="uint256">
+  Chain ID of the target SpokePool.
+</ParamField>
+
+<ParamField path="functionData" type="bytes">
+  ABI-encoded function call to send to SpokePool. Can be any arbitrary data.
+</ParamField>
+
+**Requirements:**
+- Only owner can call
+- Cross-chain contracts configured for chainId
+
+**Effects:**
+- Delegates to chain adapter to relay message cross-chain
+- SpokePool receives message and verifies it came from this HubPool
+
+**Emits:** `SpokePoolAdminFunctionTriggered(chainId, message)`
+
+**Example Usage:**
+```solidity
+// Pause deposits on Arbitrum SpokePool
+functionData = abi.encodeWithSignature("pauseDeposits(bool)", true);
+hubPool.relaySpokePoolAdminFunction(42161, functionData);
+```
+
+## Liquidity Provider Functions
+
+### addLiquidity
+
+Deposit L1 tokens to earn LP fees. Receives LP tokens representing pool share.
+
+```solidity
+function addLiquidity(
+    address l1Token,
+    uint256 l1TokenAmount
+) public payable nonReentrant unpaused
+```
+
+**Requirements:**
+- Token enabled for liquidity provision
+- If `l1Token` is WETH, `msg.value` must equal `l1TokenAmount`
+- Otherwise `msg.value` must be 0
+- Caller must approve token transfer
+
+**Emits:** `LiquidityAdded(l1Token, l1TokenAmount, lpTokensMinted, liquidityProvider)`
+
+---
+
+### removeLiquidity
+
+Burn LP tokens to redeem underlying L1 tokens plus accrued fees.
+
+```solidity
+function removeLiquidity(
+    address l1Token,
+    uint256 lpTokenAmount,
+    bool sendEth
+) public nonReentrant unpaused
+```
+
+<ParamField path="sendEth" type="bool">
+  If true and l1Token is WETH, unwrap and send ETH. Recipient must be able to receive ETH.
+</ParamField>
+
+**Emits:** `LiquidityRemoved(l1Token, l1TokensToReturn, lpTokenAmount, liquidityProvider)`
+
+## Events
+
+<ResponseField name="ProposeRootBundle" type="event">
+  Emitted when a new root bundle is proposed.
+  
+  ```solidity
+  event ProposeRootBundle(
+      uint32 challengePeriodEndTimestamp,
+      uint8 poolRebalanceLeafCount,
+      uint256[] bundleEvaluationBlockNumbers,
+      bytes32 indexed poolRebalanceRoot,
+      bytes32 indexed relayerRefundRoot,
+      bytes32 slowRelayRoot,
+      address indexed proposer
+  )
+  ```
+</ResponseField>
+
+<ResponseField name="RootBundleExecuted" type="event">
+  Emitted when a pool rebalance leaf is executed.
+  
+  ```solidity
+  event RootBundleExecuted(
+      uint256 groupIndex,
+      uint256 indexed leafId,
+      uint256 indexed chainId,
+      address[] l1Tokens,
+      uint256[] bundleLpFees,
+      int256[] netSendAmounts,
+      int256[] runningBalances,
+      address indexed caller
+  )
+  ```
+</ResponseField>
+
+<ResponseField name="RootBundleDisputed" type="event">
+  Emitted when a root bundle is disputed.
+  
+  ```solidity
+  event RootBundleDisputed(
+      address indexed disputer,
+      uint256 requestTime
+  )
+  ```
+</ResponseField>
+
+<ResponseField name="SpokePoolAdminFunctionTriggered" type="event">
+  Emitted when admin function is relayed to SpokePool.
+  
+  ```solidity
+  event SpokePoolAdminFunctionTriggered(
+      uint256 indexed chainId,
+      bytes message
+  )
+  ```
+</ResponseField>
+
+<ResponseField name="LiquidityAdded" type="event">
+  Emitted when LP adds liquidity.
+  
+  ```solidity
+  event LiquidityAdded(
+      address indexed l1Token,
+      uint256 amount,
+      uint256 lpTokensMinted,
+      address indexed liquidityProvider
+  )
+  ```
+</ResponseField>
+
+<ResponseField name="LiquidityRemoved" type="event">
+  Emitted when LP removes liquidity.
+  
+  ```solidity
+  event LiquidityRemoved(
+      address indexed l1Token,
+      uint256 amount,
+      uint256 lpTokensBurnt,
+      address indexed liquidityProvider
+  )
+  ```
+</ResponseField>
+
+## Admin Functions
+
+<AccordionGroup>
+  <Accordion title="setPaused" icon="pause">
+    Pause or unpause bundle proposal and execution. Used during upgrades or emergencies.
+    
+    ```solidity
+    function setPaused(bool pause) public onlyOwner nonReentrant
+    ```
+  </Accordion>
+
+  <Accordion title="emergencyDeleteProposal" icon="trash">
+    Delete active proposal in emergency situations (e.g., unexecutable bundle that passed liveness due to bug).
+    
+    ```solidity
+    function emergencyDeleteProposal() public onlyOwner nonReentrant
+    ```
+    
+    Returns bond to proposer if bundle had unclaimed leaves.
+  </Accordion>
+
+  <Accordion title="setProtocolFeeCapture" icon="dollar-sign">
+    Set protocol fee capture address and percentage.
+    
+    ```solidity
+    function setProtocolFeeCapture(
+        address newProtocolFeeCaptureAddress,
+        uint256 newProtocolFeeCapturePct
+    ) public onlyOwner nonReentrant
+    ```
+    
+    Fee percentage must be ≤ 1e18.
+  </Accordion>
+
+  <Accordion title="setBond" icon="shield">
+    Set bond token and amount for root bundle proposals.
+    
+    ```solidity
+    function setBond(
+        IERC20 newBondToken,
+        uint256 newBondAmount
+    ) public onlyOwner noActiveRequests nonReentrant
+    ```
+    
+    Requires token on UMA whitelist. Cannot change while active proposal exists.
+  </Accordion>
+
+  <Accordion title="setLiveness" icon="clock">
+    Set challenge period duration for root bundles.
+    
+    ```solidity
+    function setLiveness(uint32 newLiveness) public onlyOwner nonReentrant
+    ```
+    
+    Must be > 10 minutes.
+  </Accordion>
+
+  <Accordion title="setCrossChainContracts" icon="network-wired">
+    Configure adapter and SpokePool addresses for a chain.
+    
+    ```solidity
+    function setCrossChainContracts(
+        uint256 l2ChainId,
+        address adapter,
+        address spokePool
+    ) public onlyOwner nonReentrant
+    ```
+  </Accordion>
+
+  <Accordion title="setPoolRebalanceRoute" icon="route">
+    Map L1 token to its counterpart on a destination chain.
+    
+    ```solidity
+    function setPoolRebalanceRoute(
+        uint256 destinationChainId,
+        address l1Token,
+        address destinationToken
+    ) public onlyOwner nonReentrant
+    ```
+    
+    Setting destinationToken to 0x0 disables the route.
+  </Accordion>
+
+  <Accordion title="setDepositRoute" icon="arrow-right">
+    Enable/disable deposit route from origin to destination chain.
+    
+    ```solidity
+    function setDepositRoute(
+        uint256 originChainId,
+        uint256 destinationChainId,
+        address originToken,
+        bool depositsEnabled
+    ) public onlyOwner nonReentrant
+    ```
+    
+    Relays message to origin SpokePool to update its routing config.
+  </Accordion>
+
+  <Accordion title="enableL1TokenForLiquidityProvision" icon="plus">
+    Enable L1 token for LP deposits. Deploys new LP token if first time.
+    
+    ```solidity
+    function enableL1TokenForLiquidityProvision(
+        address l1Token
+    ) public onlyOwner nonReentrant
+    ```
+  </Accordion>
+
+  <Accordion title="disableL1TokenForLiquidityProvision" icon="minus">
+    Disable L1 token for new LP deposits.
+    
+    ```solidity
+    function disableL1TokenForLiquidityProvision(
+        address l1Token
+    ) public onlyOwner nonReentrant
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Security Considerations
+
+<Warning>
+**Optimistic Verification:** Root bundles rely on economic incentives and UMA's DVM for security. Invalid bundles can be disputed, but require active monitoring.
+</Warning>
+
+<Info>
+**Cross-Chain Ownership:** HubPool owns all SpokePools. Admin verification on SpokePools uses chain-specific logic (address aliasing on Arbitrum, CrossDomainMessenger on Optimism, etc.).
+</Info>
+
+- Uses UMA Optimistic Oracle V2 for dispute resolution
+- Bond slashing incentivizes honest behavior
+- Emergency functions allow admin intervention
+- Reentrancy protection on all state-changing functions
+- Exchange rate calculation prevents fee manipulation
+- LP fee distribution uses continuous interest rate model
+
+## Related Contracts
+
+- [SpokePool](/contracts/spokepool) - L2 contracts that receive rebalances and execute refunds
+- Chain Adapters - Bridge-specific adapters for each supported chain

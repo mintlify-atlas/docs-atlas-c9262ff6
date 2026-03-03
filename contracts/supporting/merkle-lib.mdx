@@ -1,0 +1,319 @@
+---
+title: "MerkleLib"
+description: "Merkle proof verification and bitmap utilities"
+---
+
+## Overview
+
+The `MerkleLib` library provides utility functions for merkle tree verification and claim tracking in the Across Protocol. It enables efficient validation of merkle proofs for pool rebalances, relayer refunds, and slow fills, as well as bitmap-based tracking of executed leaves.
+
+**Location**: `contracts/MerkleLib.sol`
+
+## Purpose
+
+MerkleLib serves two primary functions:
+
+1. **Merkle Proof Verification**: Validates that specific leaves (rebalances, refunds, fills) are included in proposed merkle roots
+2. **Claim Tracking**: Uses bitmap patterns to efficiently track which merkle leaves have been executed, preventing double-execution
+
+## Merkle Proof Functions
+
+These functions verify that specific data structures are contained within merkle trees proposed by data workers.
+
+### verifyPoolRebalance
+
+Verifies that a pool rebalance leaf is included in a merkle root.
+
+```solidity
+function verifyPoolRebalance(
+    bytes32 root,
+    HubPoolInterface.PoolRebalanceLeaf memory rebalance,
+    bytes32[] memory proof
+) internal pure returns (bool)
+```
+
+**Parameters**:
+- `root`: The merkle root to verify against
+- `rebalance`: The pool rebalance struct to verify
+- `proof`: Array of merkle proof hashes
+
+**Returns**: `true` if the rebalance is contained in the tree, `false` otherwise
+
+**Implementation**:
+```solidity
+return MerkleProof.verify(proof, root, keccak256(abi.encode(rebalance)));
+```
+
+**Used By**: HubPool when executing pool rebalance leaves to transfer tokens across chains
+
+### verifyRelayerRefund
+
+Verifies that a relayer refund leaf is included in a merkle root.
+
+```solidity
+function verifyRelayerRefund(
+    bytes32 root,
+    SpokePoolInterface.RelayerRefundLeaf memory refund,
+    bytes32[] memory proof
+) internal pure returns (bool)
+```
+
+**Parameters**:
+- `root`: The merkle root to verify against
+- `refund`: The relayer refund struct to verify
+- `proof`: Array of merkle proof hashes
+
+**Returns**: `true` if the refund is contained in the tree, `false` otherwise
+
+**Implementation**:
+```solidity
+return MerkleProof.verify(proof, root, keccak256(abi.encode(refund)));
+```
+
+**Used By**: SpokePool when executing relayer refund leaves to reimburse relayers for fills
+
+### verifyV3SlowRelayFulfillment
+
+Verifies that a V3 slow fill leaf is included in a merkle root.
+
+```solidity
+function verifyV3SlowRelayFulfillment(
+    bytes32 root,
+    V3SpokePoolInterface.V3SlowFill memory slowRelayFulfillment,
+    bytes32[] memory proof
+) internal pure returns (bool)
+```
+
+**Parameters**:
+- `root`: The merkle root to verify against
+- `slowRelayFulfillment`: The slow fill struct to verify
+- `proof`: Array of merkle proof hashes
+
+**Returns**: `true` if the slow fill is contained in the tree, `false` otherwise
+
+**Implementation**:
+```solidity
+return MerkleProof.verify(proof, root, keccak256(abi.encode(slowRelayFulfillment)));
+```
+
+**Used By**: SpokePool when executing slow fill leaves for deposits that were not filled by relayers
+
+## Claim Tracking Functions
+
+These functions implement efficient bitmap-based tracking of executed merkle leaves, preventing double-execution attacks.
+
+### 2D Bitmap Functions (Storage-Based)
+
+Used for tracking claims across multiple root bundles.
+
+#### isClaimed
+
+Checks if a specific index has been claimed in a 2D bitmap.
+
+```solidity
+function isClaimed(
+    mapping(uint256 => uint256) storage claimedBitMap,
+    uint256 index
+) internal view returns (bool)
+```
+
+**Parameters**:
+- `claimedBitMap`: Storage mapping used as a 2D bitmap
+- `index`: The index to check
+
+**Returns**: `true` if the index has been claimed, `false` otherwise
+
+**Implementation**:
+```solidity
+uint256 claimedWordIndex = index / 256;
+uint256 claimedBitIndex = index % 256;
+uint256 claimedWord = claimedBitMap[claimedWordIndex];
+uint256 mask = (1 << claimedBitIndex);
+return claimedWord & mask == mask;
+```
+
+**How It Works**:
+- Divides the index space into 256-bit "words"
+- Each word is stored as a `uint256` in the mapping
+- Within each word, individual bits represent claim status
+
+#### setClaimed
+
+Marks a specific index as claimed in a 2D bitmap.
+
+```solidity
+function setClaimed(
+    mapping(uint256 => uint256) storage claimedBitMap,
+    uint256 index
+) internal
+```
+
+**Parameters**:
+- `claimedBitMap`: Storage mapping used as a 2D bitmap
+- `index`: The index to mark as claimed
+
+**Implementation**:
+```solidity
+uint256 claimedWordIndex = index / 256;
+uint256 claimedBitIndex = index % 256;
+claimedBitMap[claimedWordIndex] = claimedBitMap[claimedWordIndex] | (1 << claimedBitIndex);
+```
+
+### 1D Bitmap Functions (In-Memory)
+
+Used for tracking claims within a single uint256 value (up to 256 claims).
+
+#### isClaimed1D
+
+Checks if a specific index has been claimed in a 1D bitmap.
+
+```solidity
+function isClaimed1D(
+    uint256 claimedBitMap,
+    uint8 index
+) internal pure returns (bool)
+```
+
+**Parameters**:
+- `claimedBitMap`: A `uint256` value encoding a 1D bitmap
+- `index`: The index to check (0-255)
+
+**Returns**: `true` if the index has been claimed, `false` otherwise
+
+**Implementation**:
+```solidity
+uint256 mask = (1 << index);
+return claimedBitMap & mask == mask;
+```
+
+**Use Cases**:
+- Tracking execution status within a single transaction
+- Packing multiple claim states into a single storage slot
+
+#### setClaimed1D
+
+Marks a specific index as claimed in a 1D bitmap.
+
+```solidity
+function setClaimed1D(
+    uint256 claimedBitMap,
+    uint8 index
+) internal pure returns (uint256)
+```
+
+**Parameters**:
+- `claimedBitMap`: A `uint256` value encoding a 1D bitmap
+- `index`: The index to mark as claimed (0-255)
+
+**Returns**: The modified bitmap with the index set to true
+
+**Implementation**:
+```solidity
+return claimedBitMap | (1 << index);
+```
+
+## Usage in Across Protocol
+
+### Root Bundle Execution Flow
+
+1. **Proposal**: Data worker proposes a root bundle containing merkle roots for:
+   - Pool rebalances (HubPool → SpokePools token transfers)
+   - Relayer refunds (reimbursements for fills)
+   - Slow fills (protocol-executed fills)
+
+2. **Execution Request**: After liveness period, actors call execution functions with:
+   - The leaf data (rebalance, refund, or slow fill)
+   - A merkle proof showing inclusion in the root
+
+3. **Verification**: Contract uses MerkleLib to:
+   - Verify the proof against the stored root
+   - Check if the leaf has already been executed
+   - Mark the leaf as claimed to prevent re-execution
+
+### Example: Relayer Refund Execution
+
+```solidity
+// In SpokePool.executeRelayerRefundLeaf()
+function executeRelayerRefundLeaf(
+    uint32 rootBundleId,
+    SpokePoolInterface.RelayerRefundLeaf memory refundLeaf,
+    bytes32[] memory proof
+) public {
+    // Get the merkle root for this bundle
+    bytes32 root = rootBundles[rootBundleId].relayerRefundRoot;
+    
+    // Verify the leaf is in the tree
+    require(
+        MerkleLib.verifyRelayerRefund(root, refundLeaf, proof),
+        "Invalid proof"
+    );
+    
+    // Check if already claimed
+    uint256 leafId = refundLeaf.leafId;
+    require(
+        !MerkleLib.isClaimed(claimedRelayerRefunds[rootBundleId], leafId),
+        "Already claimed"
+    );
+    
+    // Mark as claimed
+    MerkleLib.setClaimed(claimedRelayerRefunds[rootBundleId], leafId);
+    
+    // Execute the refund...
+}
+```
+
+## Bitmap Efficiency
+
+### Why Bitmaps?
+
+Bitmaps provide significant gas savings compared to alternative approaches:
+
+| Approach | Gas per Claim Check | Gas per Claim Set |
+|----------|---------------------|-------------------|
+| `mapping(uint256 => bool)` | ~2,100 (cold) | ~20,000 (cold) |
+| Bitmap (2D) | ~2,100 (cold) | ~20,000 (cold, first bit in word) |
+| Bitmap (2D) | ~800 (warm) | ~5,000 (warm, same word) |
+
+**Key Advantage**: When multiple claims are in the same 256-bit word, subsequent operations after the first are much cheaper ("warm" access).
+
+### 1D vs 2D Bitmaps
+
+- **1D (`isClaimed1D`, `setClaimed1D`)**: Best for single-storage-slot scenarios or temporary tracking within a transaction
+- **2D (`isClaimed`, `setClaimed`)**: Best for persistent, unbounded claim tracking across many root bundles
+
+## Security Considerations
+
+### Double-Execution Prevention
+
+The claim tracking system prevents double-execution attacks:
+- Without claim tracking, an attacker could execute the same refund leaf multiple times
+- Bitmaps ensure each leaf can only be executed once
+
+### Merkle Proof Validation
+
+MerkleLib relies on OpenZeppelin's `MerkleProof.verify()`, which:
+- Implements standard merkle proof verification
+- Is battle-tested across many protocols
+- Prevents proof forgery and inclusion attacks
+
+### Leaf Encoding
+
+Leaves are encoded using `abi.encode()` before hashing:
+```solidity
+keccak256(abi.encode(rebalance))
+```
+
+This ensures:
+- Consistent encoding across different struct types
+- No possibility of collision between different leaf types
+- Compatibility with off-chain merkle tree construction
+
+## Attribution
+
+The claim tracking functions are adapted from [Uniswap's MerkleDistributor](https://github.com/Uniswap/merkle-distributor/blob/master/contracts/MerkleDistributor.sol) with minor modifications for Across Protocol's use cases.
+
+## Related Contracts
+
+- **HubPool**: Uses MerkleLib to execute pool rebalance leaves
+- **SpokePool**: Uses MerkleLib to execute relayer refund and slow fill leaves
+- **MerkleProof (OpenZeppelin)**: Underlying verification logic

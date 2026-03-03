@@ -1,0 +1,400 @@
+---
+title: Foundry Tests
+description: Guide to writing and running Foundry tests for Across Protocol smart contracts
+---
+
+## Overview
+
+Foundry is the **primary testing framework** for Across Protocol. All new tests should be written in Foundry using Solidity.
+
+### Why Foundry?
+
+- **Fast execution**: Tests run directly in EVM, no JS overhead
+- **Gas-efficient**: Built-in gas profiling and optimization
+- **Solidity-native**: Write tests in the same language as contracts
+- **Fork testing**: Easy integration with live network state
+- **Advanced features**: Fuzzing, invariant testing, trace debugging
+
+## Required Configuration
+
+<Warning>
+**CRITICAL**: Always use `FOUNDRY_PROFILE=local-test` when running local Foundry tests.
+</Warning>
+
+Do **NOT** run `forge test` without the profile. The default profile includes fork tests that require network access.
+
+### Correct Usage
+
+```bash
+# Recommended: Use yarn script (sets profile automatically)
+yarn test-evm-foundry
+
+# Alternative: Set profile manually
+FOUNDRY_PROFILE=local-test forge test
+```
+
+### Why This Profile?
+
+The `local-test` profile (defined in `foundry.toml`):
+
+- Points to `test/evm/foundry/local/` (excludes fork tests)
+- Enables detailed revert strings for debugging
+- Uses separate cache/output directories to avoid conflicts
+
+## Test Structure
+
+### Directory Layout
+
+```
+test/evm/foundry/
+  local/              # Local unit tests
+    HubPool_Admin.t.sol
+    Router_Adapter.t.sol
+    SpokePool_Deposit.t.sol
+    chain-adapters/   # Chain-specific adapter tests
+      Arbitrum_Adapter.t.sol
+      Optimism_Adapter.t.sol
+  fork/               # Fork tests (requires network RPC)
+    HubPool_Fork.t.sol
+  utils/              # Shared test utilities
+    HubPoolTestBase.sol
+```
+
+### Test File Naming
+
+- Use `.t.sol` suffix: `ContractName_Feature.t.sol`
+- Examples:
+  - `HubPool_Admin.t.sol` - Admin functions
+  - `Router_Adapter.t.sol` - Router adapter tests
+  - `SpokePool_Deposit.t.sol` - Deposit functionality
+
+### Test Contract Structure
+
+```solidity
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.0;
+
+import { Test } from "forge-std/Test.sol";
+import { MyContract } from "../../../contracts/MyContract.sol";
+
+contract MyContractTest is Test {
+    MyContract myContract;
+    address user;
+    address admin;
+
+    function setUp() public {
+        user = makeAddr("user");
+        admin = makeAddr("admin");
+        myContract = new MyContract(admin);
+    }
+
+    function testBasicFunctionality() public {
+        // Arrange
+        uint256 amount = 100;
+        
+        // Act
+        vm.prank(user);
+        myContract.deposit(amount);
+        
+        // Assert
+        assertEq(myContract.balanceOf(user), amount);
+    }
+
+    function testRevertCondition() public {
+        vm.expectRevert("Error message");
+        myContract.unauthorizedAction();
+    }
+}
+```
+
+## Common Test Patterns
+
+### Using Mocks with vm.mockCall
+
+<Tip>
+**Prefer `vm.mockCall` over custom mocks** for simple return values. This is the recommended pattern in Across Protocol.
+</Tip>
+
+```solidity
+function testWithMockCall() public {
+    address fakeContract = makeAddr("fakeContract");
+    
+    // Bypass extcodesize check (required for mock calls)
+    vm.etch(fakeContract, hex"00");
+    
+    // Mock the return value
+    vm.mockCall(
+        fakeContract,
+        abi.encodeWithSelector(IERC20.balanceOf.selector, address(this)),
+        abi.encode(1000)
+    );
+    
+    // Verify the call is made with expected parameters
+    vm.expectCall(
+        fakeContract,
+        0, // msg.value
+        abi.encodeWithSelector(IERC20.transfer.selector, recipient, amount)
+    );
+    
+    // Execute your test
+    myContract.transferTokens(fakeContract, recipient, amount);
+}
+```
+
+### Real Example from Router_Adapter.t.sol
+
+```solidity
+function testRelayWeth(uint256 amountToSend, address random) public {
+    // Prevent fuzz testing with amountToSend * 2 > 2^256
+    amountToSend = uint256(bound(amountToSend, 1, 2 ** 254));
+    vm.deal(address(l1Weth), amountToSend);
+    vm.deal(address(routerAdapter), amountToSend);
+
+    vm.startPrank(address(routerAdapter));
+    l1Weth.deposit{ value: amountToSend }();
+    vm.stopPrank();
+
+    assertEq(amountToSend * 2, l1Weth.totalSupply());
+    vm.expectEmit(address(standardBridge));
+    emit MockBedrockL1StandardBridge.ETHDepositInitiated(l2Target, amountToSend);
+    routerAdapter.relayTokens(address(l1Weth), address(l2Weth), amountToSend, random);
+    assertEq(0, l1Weth.balanceOf(address(routerAdapter)));
+}
+```
+
+### Testing Admin Functions
+
+From `HubPool_Admin.t.sol`:
+
+```solidity
+function test_EnableL1TokenForLiquidityProvision() public {
+    // Before enabling, lpToken should be zero address
+    (address lpTokenBefore, , , , , ) = fixture.hubPool.pooledTokens(address(fixture.weth));
+    assertEq(lpTokenBefore, address(0), "lpToken should be zero before enabling");
+
+    // Enable the token
+    fixture.hubPool.enableL1TokenForLiquidityProvision(address(fixture.weth));
+
+    // After enabling, verify the pooledTokens struct
+    (address lpToken, bool isEnabled, uint32 lastLpFeeUpdate, , , ) = 
+        fixture.hubPool.pooledTokens(address(fixture.weth));
+
+    assertTrue(lpToken != address(0), "lpToken should not be zero after enabling");
+    assertTrue(isEnabled, "isEnabled should be true");
+    assertEq(lastLpFeeUpdate, block.timestamp, "lastLpFeeUpdate should be current time");
+}
+
+function test_EnableL1Token_RevertsIfNotOwner() public {
+    vm.prank(otherUser);
+    vm.expectRevert("Ownable: caller is not the owner");
+    fixture.hubPool.enableL1TokenForLiquidityProvision(address(fixture.weth));
+}
+```
+
+### Fuzz Testing
+
+```solidity
+function testFuzzDeposit(uint256 amount, address depositor) public {
+    // Bound inputs to valid ranges
+    amount = bound(amount, 1, 1e27);
+    vm.assume(depositor != address(0));
+    
+    // Test logic
+    vm.startPrank(depositor);
+    token.mint(depositor, amount);
+    token.approve(address(spokePool), amount);
+    spokePool.deposit(address(token), amount);
+    vm.stopPrank();
+    
+    assertEq(spokePool.balanceOf(depositor), amount);
+}
+```
+
+## Test Gotchas
+
+### 1. Use Existing Mocks
+
+Check `contracts/test/` before creating new mocks:
+
+- `MockCCTP.sol` - CCTP token messenger
+- `ArbitrumMocks.sol` - Arbitrum bridge contracts
+- `MockBedrockStandardBridge.sol` - OP Stack bridges
+- `MockSpokePool.sol` - SpokePool for testing
+
+### 2. MockSpokePool Requires UUPS Proxy
+
+MockSpokePool is upgradeable and **must** be deployed via proxy:
+
+```solidity
+import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+
+function setUp() public {
+    MockSpokePool implementation = new MockSpokePool(weth);
+    
+    bytes memory initData = abi.encodeCall(
+        MockSpokePool.initialize,
+        (initialDepositId, hubPool, crossDomainAdmin)
+    );
+    
+    ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
+    spokePool = MockSpokePool(address(proxy));
+}
+```
+
+### 3. Delegatecall Context
+
+When testing adapters via HubPool's `delegatecall`:
+
+- Events emit from HubPool's address, not the adapter
+- `vm.expectRevert()` may lose error data
+- Use `vm.expectEmit()` carefully with correct address
+
+```solidity
+// Expect event from HubPool, not adapter
+vm.expectEmit(address(hubPool));
+emit TokensRelayed(...);
+hubPool.relaySpokePoolAdminFunction(chainId, message);
+```
+
+### 4. vm.etch for Mock Calls
+
+Always use `vm.etch` before `vm.mockCall` to bypass the `extcodesize` check:
+
+```solidity
+address mockAddr = makeAddr("mock");
+vm.etch(mockAddr, hex"00");  // Required!
+vm.mockCall(mockAddr, abi.encodeWithSelector(...), abi.encode(...));
+```
+
+## Running Tests
+
+### Basic Commands
+
+```bash
+# Run all local tests
+FOUNDRY_PROFILE=local-test forge test
+
+# Run specific contract
+FOUNDRY_PROFILE=local-test forge test --match-contract HubPool_AdminTest
+
+# Run specific test
+FOUNDRY_PROFILE=local-test forge test --match-test testDeposit
+
+# Verbose output (useful for debugging)
+FOUNDRY_PROFILE=local-test forge test -vvv
+
+# Very verbose (shows trace for all tests)
+FOUNDRY_PROFILE=local-test forge test -vvvv
+```
+
+### Gas Reporting
+
+```bash
+# Show gas usage for all tests
+FOUNDRY_PROFILE=local-test forge test --gas-report
+
+# Save gas snapshot for comparison
+FOUNDRY_PROFILE=local-test forge snapshot
+
+# Compare against saved snapshot
+FOUNDRY_PROFILE=local-test forge snapshot --diff
+```
+
+### Debugging Failed Tests
+
+```bash
+# Show detailed traces (-vvvv)
+FOUNDRY_PROFILE=local-test forge test --match-test testFailingTest -vvvv
+
+# Show stack traces for reverts
+FOUNDRY_PROFILE=local-test forge test --match-test testRevert -vvv
+```
+
+## Configuration (foundry.toml)
+
+<Warning>
+**Do not modify `foundry.toml` without asking.** The configuration is optimized for the project's specific needs.
+</Warning>
+
+Key settings for `local-test` profile:
+
+```toml
+[profile.local-test]
+test = "test/evm/foundry/local"  # Only local tests, no forks
+revert_strings = "default"       # Full revert messages for debugging
+cache_path = "cache-foundry-local"
+out = "out-local"
+```
+
+## Examples from Real Tests
+
+### HubPool_Admin.t.sol
+
+Location: `test/evm/foundry/local/HubPool_Admin.t.sol`
+
+Tests admin functions like enabling tokens for liquidity provision:
+
+```solidity
+contract HubPool_AdminTest is HubPoolTestBase {
+    function test_EnableL1TokenForLiquidityProvision() public {
+        fixture.hubPool.enableL1TokenForLiquidityProvision(address(fixture.weth));
+        (address lpToken, bool isEnabled, , , , ) = 
+            fixture.hubPool.pooledTokens(address(fixture.weth));
+        assertTrue(lpToken != address(0));
+        assertTrue(isEnabled);
+    }
+}
+```
+
+### Router_Adapter.t.sol
+
+Location: `test/evm/foundry/local/Router_Adapter.t.sol`
+
+Tests L2 message routing and token bridging:
+
+```solidity
+contract RouterAdapterTest is Test {
+    function testRelayMessage(address target, bytes memory message) public {
+        vm.assume(target != l2Target);
+        vm.expectEmit(address(crossDomainMessenger));
+        emit MockBedrockCrossDomainMessenger.MessageSent(l2Target);
+        routerAdapter.relayMessage(target, message);
+    }
+}
+```
+
+### MulticallHandler.t.sol
+
+Location: `test/evm/foundry/local/MulticallHandler.t.sol`
+
+Demonstrates `vm.mockCall` pattern:
+
+```solidity
+function setUp() public {
+    handler = new MulticallHandler();
+    
+    bytes memory balanceCall = abi.encodeWithSelector(
+        IERC20.balanceOf.selector, 
+        address(handler)
+    );
+    bytes memory transferCall = abi.encodeWithSelector(
+        IERC20.transfer.selector, 
+        recipient, 
+        amount
+    );
+    
+    vm.mockCall(testToken, balanceCall, abi.encode(5));
+    vm.mockCall(testToken, transferCall, abi.encode(true));
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Testing Overview" icon="vial" href="/development/testing">
+    Return to testing overview
+  </Card>
+  <Card title="Hardhat Tests" icon="hammer" href="/development/hardhat">
+    Learn about legacy Hardhat tests
+  </Card>
+</CardGroup>

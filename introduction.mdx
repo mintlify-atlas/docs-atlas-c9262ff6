@@ -1,0 +1,113 @@
+---
+title: Introduction
+description: Welcome to Across Protocol - the fastest and most capital-efficient cross-chain bridge
+---
+
+Across Protocol enables instant token transfers between any two blockchain networks. Using a hub-and-spoke architecture with optimistic verification, Across combines speed, capital efficiency, and security to deliver the best cross-chain bridging experience.
+
+## What is Across Protocol?
+
+Across is a cross-chain bridge that allows users to transfer tokens from one blockchain to another. Instead of waiting for slow canonical bridges, relayers front tokens on the destination chain and are later reimbursed via a settlement process on Ethereum L1.
+
+**Key advantages:**
+
+- **Instant transfers**: Relayers fulfill deposits in seconds rather than hours
+- **Capital efficient**: Shared liquidity pool on L1 backs all chains
+- **Secure by design**: Optimistic verification with UMA's oracle for dispute resolution
+- **Production ready**: Audited by OpenZeppelin with continuous security reviews
+
+## Hub-and-spoke architecture
+
+Across uses a hub-and-spoke model where all cross-chain transfers are coordinated through Ethereum L1:
+
+<CardGroup cols={3}>
+  <Card title="HubPool (L1)" icon="circle-nodes">
+    Central contract on Ethereum that manages LP liquidity, validates cross-chain transfers via merkle roots, and coordinates rebalancing across all SpokePools
+  </Card>
+  <Card title="SpokePool (L2)" icon="circle-dot">
+    Deployed on each supported chain to handle user deposits, relayer fills, and execution of merkle proofs for refunds
+  </Card>
+  <Card title="Chain Adapters" icon="bridge">
+    Stateless contracts that bridge tokens and relay messages between L1 and each L2 using native bridges
+  </Card>
+</CardGroup>
+
+### Cross-chain ownership
+
+The HubPool on Ethereum L1 owns all L2 SpokePools. Admin functions are relayed cross-chain via `relaySpokePoolAdminFunction()` through chain-specific adapters. Each SpokePool verifies the admin using chain-specific logic (address aliasing on Arbitrum, CrossDomainMessenger on Optimism, etc.).
+
+## Protocol participants
+
+| Role | Description |
+|------|-------------|
+| **Depositor** | End user who initiates a cross-chain transfer on the origin SpokePool |
+| **Relayer** | Fills deposits on destination chain by fronting tokens, later reimbursed via merkle proof |
+| **Data Worker** | Off-chain agent that validates deposits/fills, constructs merkle trees, and proposes root bundles to HubPool |
+| **Disputer** | Monitors proposed bundles and disputes invalid ones during the challenge period |
+| **LP** | Deposits L1 tokens into HubPool to earn relay fees |
+
+## How it works
+
+<Steps>
+  <Step title="User deposits tokens">
+    User locks tokens in the origin chain SpokePool and specifies the destination chain, output amount, and fee they're willing to pay
+  </Step>
+  <Step title="Relayer fills the deposit">
+    A relayer sees the deposit event, evaluates profitability, and sends the output tokens to the recipient on the destination chain
+  </Step>
+  <Step title="Data worker proposes bundle">
+    The data worker validates all fills across chains, constructs merkle trees (relayer refunds, slow fills, pool rebalances), and proposes a root bundle to the HubPool
+  </Step>
+  <Step title="Challenge period">
+    The bundle enters a challenge period (default 2 hours) where disputers can challenge invalid bundles using UMA's Optimistic Oracle
+  </Step>
+  <Step title="Bundle execution">
+    After the challenge period, the bundle is executed: tokens are bridged to SpokePools, and relayers claim their refunds via merkle proofs
+  </Step>
+  <Step title="Slow fill fallback">
+    If no relayer fills before the deadline, the protocol executes a slow fill from SpokePool reserves
+  </Step>
+</Steps>
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="UUPS upgradeable" icon="arrow-up">
+    All SpokePool contracts are UUPS upgradeable proxies, allowing the protocol to evolve while maintaining stable addresses
+  </Card>
+  <Card title="Optimistic verification" icon="shield-check">
+    Uses UMA's Optimistic Oracle for dispute resolution, assuming bundles are valid unless challenged
+  </Card>
+  <Card title="Multiple deposit flows" icon="arrows-split">
+    Supports standard deposits, gasless deposits, and sponsored CCTP flows for USDC transfers
+  </Card>
+  <Card title="Cross-chain messaging" icon="message">
+    Deposits can include arbitrary messages delivered to recipient contracts on the destination chain
+  </Card>
+</CardGroup>
+
+## Get started
+
+<CardGroup cols={3}>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Build and test the contracts locally
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Deep dive into the protocol design
+  </Card>
+  <Card title="Core contracts" icon="file-contract" href="/contracts/hubpool">
+    Explore HubPool and SpokePool contracts
+  </Card>
+</CardGroup>
+
+## Security
+
+Across Protocol contracts have been continuously audited by OpenZeppelin. All audit reports are available at [docs.across.to/resources/audits](https://docs.across.to/resources/audits).
+
+<Warning>
+This contract should be deprecated by the year 2106, at which point uint32 timestamps will roll over. Before this date, the contract should be paused from accepting new root bundles.
+</Warning>
+
+## License
+
+All code is licensed under BUSL-1.1 unless specified differently in the file. Individual exceptions can be made by Risk Labs. For derivative work inquiries, contact licensing@risklabs.foundation.

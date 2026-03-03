@@ -1,0 +1,316 @@
+---
+title: Arbitrum Adapter
+description: Bridge tokens and messages to Arbitrum using retryable tickets
+---
+
+## Overview
+
+The `Arbitrum_Adapter` enables the HubPool to bridge tokens and send messages from Ethereum L1 to Arbitrum using Arbitrum's [Retryable Ticket](https://docs.arbitrum.io/arbos/l1-to-l2-messaging) system.
+
+## Key Features
+
+- **Retryable Tickets**: Uses Arbitrum Inbox to create retryable L2 transactions
+- **Address Aliasing**: L1 contract addresses are aliased when calling L2 contracts
+- **Multiple Bridge Paths**: Supports native bridge, CCTP, and LayerZero OFT
+- **Gas Pre-funding**: Requires ETH deposit to pay for L2 execution
+
+## Contract Reference
+
+**Location**: `contracts/chain-adapters/Arbitrum_Adapter.sol`
+
+### Constructor
+
+```solidity
+constructor(
+    ArbitrumL1InboxLike _l1ArbitrumInbox,
+    ArbitrumL1ERC20GatewayLike _l1ERC20GatewayRouter,
+    address _l2RefundL2Address,
+    IERC20 _l1Usdc,
+    ITokenMessenger _cctpTokenMessenger,
+    address _adapterStore,
+    uint32 _oftDstEid,
+    uint256 _oftFeeCap
+)
+```
+
+**Parameters**:
+- `_l1ArbitrumInbox` - Arbitrum Inbox contract for creating retryable tickets
+- `_l1ERC20GatewayRouter` - Gateway router for ERC20 token bridging
+- `_l2RefundL2Address` - L2 address to receive excess ETH refunds
+- `_l1Usdc` - USDC token address on L1
+- `_cctpTokenMessenger` - Circle CCTP TokenMessenger for USDC bridging
+- `_adapterStore` - Storage contract for OFT bridging
+- `_oftDstEid` - LayerZero endpoint ID for Arbitrum
+- `_oftFeeCap` - Maximum fee cap for OFT bridging (e.g., 1 ether)
+
+### Constants
+
+```solidity
+// L2 gas parameters
+uint256 public constant L2_MAX_SUBMISSION_COST = 0.01e18;  // 0.01 ETH
+uint256 public constant L2_GAS_PRICE = 5e9;                 // 5 gwei
+uint256 public constant L2_CALL_VALUE = 0;                  // No msg.value sent to L2
+
+// Gas limits for different operations
+uint32 public constant RELAY_TOKENS_L2_GAS_LIMIT = 300_000;
+uint32 public constant RELAY_MESSAGE_L2_GAS_LIMIT = 2_000_000;
+
+// Special token addresses
+address public constant L1_DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+```
+
+## Core Functions
+
+### relayMessage()
+
+Sends arbitrary messages from L1 to Arbitrum via retryable tickets.
+
+```solidity
+function relayMessage(address target, bytes memory message) external payable override {
+    uint256 requiredL1CallValue = _contractHasSufficientEthBalance(RELAY_MESSAGE_L2_GAS_LIMIT);
+
+    L1_INBOX.createRetryableTicket{ value: requiredL1CallValue }(
+        target,                      // destAddr - L2 contract address
+        L2_CALL_VALUE,              // l2CallValue - msg.value for L2 call (0)
+        L2_MAX_SUBMISSION_COST,     // maxSubmissionCost - storage cost
+        L2_REFUND_L2_ADDRESS,       // excessFeeRefundAddress
+        L2_REFUND_L2_ADDRESS,       // callValueRefundAddress
+        RELAY_MESSAGE_L2_GAS_LIMIT, // maxGas - L2 gas limit
+        L2_GAS_PRICE,               // gasPriceBid
+        message                     // data - calldata for L2
+    );
+
+    emit MessageRelayed(target, message);
+}
+```
+
+**Usage**: Called via delegatecall from HubPool to execute admin functions on Arbitrum SpokePool.
+
+**Requirements**:
+- HubPool must hold at least `getL1CallValue(RELAY_MESSAGE_L2_GAS_LIMIT)` ETH
+- Target should be the Arbitrum SpokePool address
+
+### relayTokens()
+
+Bridges tokens from L1 to Arbitrum using the appropriate bridge.
+
+```solidity
+function relayTokens(
+    address l1Token,
+    address l2Token,  // unused for Arbitrum
+    uint256 amount,
+    address to
+) external payable override {
+    address oftMessenger = _getOftMessenger(l1Token);
+
+    // Check bridge priority: CCTP > OFT > Native Gateway
+    if (_isCCTPEnabled() && l1Token == address(usdcToken)) {
+        _transferUsdc(to, amount);
+    } else if (oftMessenger != address(0)) {
+        _transferViaOFT(IERC20(l1Token), IOFT(oftMessenger), to, amount);
+    } else {
+        uint256 requiredL1CallValue = _contractHasSufficientEthBalance(RELAY_TOKENS_L2_GAS_LIMIT);
+
+        // Approve the gateway (not the router) to spend tokens
+        address erc20Gateway = L1_ERC20_GATEWAY_ROUTER.getGateway(l1Token);
+        IERC20(l1Token).safeIncreaseAllowance(erc20Gateway, amount);
+
+        bytes memory data = abi.encode(L2_MAX_SUBMISSION_COST, "");
+
+        if (l1Token == L1_DAI) {
+            // Legacy DAI gateway doesn't support custom refund address
+            L1_ERC20_GATEWAY_ROUTER.outboundTransfer{ value: requiredL1CallValue }(
+                l1Token,
+                to,
+                amount,
+                RELAY_TOKENS_L2_GAS_LIMIT,
+                L2_GAS_PRICE,
+                data
+            );
+        } else {
+            // Modern gateway with custom refund address
+            L1_ERC20_GATEWAY_ROUTER.outboundTransferCustomRefund{ value: requiredL1CallValue }(
+                l1Token,
+                L2_REFUND_L2_ADDRESS,
+                to,
+                amount,
+                RELAY_TOKENS_L2_GAS_LIMIT,
+                L2_GAS_PRICE,
+                data
+            );
+        }
+    }
+    emit TokensRelayed(l1Token, l2Token, amount, to);
+}
+```
+
+**Bridge Selection Logic**:
+1. **USDC**: Uses Circle CCTP for native USDC
+2. **OFT tokens**: Uses LayerZero if OFT messenger is configured
+3. **DAI**: Uses legacy Arbitrum DAI gateway (refunds to aliased HubPool)
+4. **Other tokens**: Uses standard Arbitrum ERC20 gateway
+
+### getL1CallValue()
+
+Calculates the required ETH to send a message via the Inbox.
+
+```solidity
+function getL1CallValue(uint32 l2GasLimit) public pure returns (uint256) {
+    return L2_MAX_SUBMISSION_COST + L2_GAS_PRICE * l2GasLimit;
+}
+```
+
+**Example**:
+```solidity
+// For relayMessage:
+getL1CallValue(2_000_000) = 0.01 ETH + 5 gwei * 2M = 0.02 ETH
+
+// For relayTokens:
+getL1CallValue(300_000) = 0.01 ETH + 5 gwei * 300k = 0.0115 ETH
+```
+
+## Address Aliasing
+
+When the HubPool sends messages to Arbitrum, its address is "aliased" on L2 to prevent L1 contract addresses from colliding with L2 addresses.
+
+**Aliasing Formula**:
+```solidity
+aliasedAddress = l1Address + 0x1111000000000000000000000000000000001111
+```
+
+**Implications**:
+- Arbitrum SpokePool's `_requireAdminSender()` checks the aliased HubPool address
+- Excess ETH refunds for DAI bridging are sent to the aliased HubPool address
+- Use `Arbitrum_RescueAdapter` to retrieve stuck ETH from the aliased address
+
+```solidity
+// In Arbitrum_SpokePool.sol
+function _requireAdminSender() internal view override {
+    address aliasedHubPool = AddressAliasHelper.applyL1ToL2Alias(hubPool);
+    require(msg.sender == aliasedHubPool, "Only aliased HubPool");
+}
+```
+
+## Gas Management
+
+### ETH Balance Requirements
+
+The HubPool must hold sufficient ETH before calling adapter functions:
+
+```solidity
+function _contractHasSufficientEthBalance(uint32 l2GasLimit) internal view returns (uint256) {
+    uint256 requiredL1CallValue = getL1CallValue(l2GasLimit);
+    require(address(this).balance >= requiredL1CallValue, "Insufficient ETH balance");
+    return requiredL1CallValue;
+}
+```
+
+### Refund Handling
+
+- **Standard tokens**: Excess ETH refunded to `L2_REFUND_L2_ADDRESS`
+- **DAI**: Excess ETH refunded to aliased HubPool address (requires rescue adapter)
+
+## Bridge Contracts
+
+### Arbitrum Inbox
+
+**Address**: Set in constructor (e.g., `0x4Dbd4fc535Ac27206064B68FfCf827b0A60BAB3f` on mainnet)
+
+**Interface**:
+```solidity
+interface ArbitrumL1InboxLike {
+    function createRetryableTicket(
+        address destAddr,
+        uint256 l2CallValue,
+        uint256 maxSubmissionCost,
+        address excessFeeRefundAddress,
+        address callValueRefundAddress,
+        uint256 maxGas,
+        uint256 gasPriceBid,
+        bytes calldata data
+    ) external payable returns (uint256);
+}
+```
+
+### ERC20 Gateway Router
+
+**Address**: Set in constructor (e.g., `0x72Ce9c846789fdB6fC1f34aC4AD25Dd9ef7031ef` on mainnet)
+
+**Interface**:
+```solidity
+interface ArbitrumL1ERC20GatewayLike {
+    function getGateway(address token) external view returns (address);
+    
+    function outboundTransfer(
+        address token,
+        address to,
+        uint256 amount,
+        uint256 maxGas,
+        uint256 gasPriceBid,
+        bytes calldata data
+    ) external payable returns (bytes memory);
+    
+    function outboundTransferCustomRefund(
+        address token,
+        address refundTo,
+        address to,
+        uint256 amount,
+        uint256 maxGas,
+        uint256 gasPriceBid,
+        bytes calldata data
+    ) external payable returns (bytes memory);
+}
+```
+
+## Special Cases
+
+### DAI Bridging
+
+DAI uses a legacy custom gateway that doesn't support `outboundTransferCustomRefund()`. Excess ETH is refunded to the aliased HubPool address on L2.
+
+**Recovery Process**:
+1. Call `HubPool.setCrossChainContracts()` to set `Arbitrum_RescueAdapter`
+2. Call `HubPool.relaySpokePoolAdminFunction()` with rescue amount
+3. Restore original `Arbitrum_Adapter` via `setCrossChainContracts()`
+
+## Examples
+
+### Relay Admin Function to Arbitrum SpokePool
+
+```solidity
+// On HubPool
+bytes memory functionData = abi.encodeCall(
+    SpokePool.setDepositRoute,
+    (originToken, destinationChainId, destinationToken, enabled)
+);
+
+hubPool.relaySpokePoolAdminFunction(
+    42161,  // Arbitrum chain ID
+    functionData
+);
+```
+
+### Bridge USDC to Arbitrum
+
+```solidity
+// Internally calls Arbitrum_Adapter.relayTokens() via delegatecall
+hubPool.loadEthForL2Calls{ value: 0.02 ether }();  // Pre-fund ETH
+
+// CCTP will be used automatically for USDC
+hubPool.relayTokens(
+    USDC_L1,
+    USDC_ARBITRUM,
+    1000e6,  // 1000 USDC
+    spokePoolAddress
+);
+```
+
+## Related Contracts
+
+- `Arbitrum_SpokePool.sol` - Receives messages and validates admin sender
+- `Arbitrum_RescueAdapter.sol` - Rescues ETH from aliased HubPool address
+- `Arbitrum_CustomGasToken_Adapter.sol` - For Arbitrum chains using custom gas tokens
+
+## Source Code
+
+[View on GitHub](https://github.com/across-protocol/contracts/blob/master/contracts/chain-adapters/Arbitrum_Adapter.sol)

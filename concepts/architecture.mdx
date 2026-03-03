@@ -1,0 +1,253 @@
+---
+title: "System Architecture"
+description: "Overview of Across Protocol's hub-and-spoke architecture and core components"
+---
+
+## Overview
+
+Across Protocol uses a **hub-and-spoke model** with optimistic verification to enable fast, secure cross-chain token transfers. This architecture centralizes liquidity and governance on Ethereum L1 while deploying lightweight contracts on multiple L2s and sidechains.
+
+## Core Components
+
+### HubPool (Ethereum L1)
+
+The HubPool is the central contract deployed on Ethereum that:
+
+- **Manages LP Liquidity**: Accepts deposits from liquidity providers who earn fees for funding relays
+- **Validates Transfers**: Uses merkle root bundles to verify cross-chain transfers via optimistic verification
+- **Coordinates Rebalancing**: Sends tokens to SpokePools across all supported chains to refund relayers
+- **Resolves Disputes**: Integrates with UMA's Optimistic Oracle for dispute resolution
+- **Owns All SpokePools**: Acts as the cross-chain administrator for all deployed SpokePools
+
+<CodeGroup>
+```solidity contracts/HubPool.sol
+/**
+ * @notice Contract deployed on Ethereum that houses L1 token liquidity for all SpokePools.
+ * @notice This contract is meant to act as the cross chain administrator and owner of all
+ * L2 spoke pools, so all governance actions and pool rebalances originate from here.
+ */
+contract HubPool is HubPoolInterface, Testable, Lockable, MultiCaller, Ownable {
+    // Root bundle proposal storage
+    RootBundle public rootBundleProposal;
+    
+    // LP liquidity tracking
+    mapping(address => PooledToken) public pooledTokens;
+    
+    // Cross-chain contract mappings
+    mapping(uint256 => CrossChainContract) public crossChainContracts;
+    
+    // Pool rebalance routes
+    mapping(bytes32 => address) private poolRebalanceRoutes;
+}
+```
+</CodeGroup>
+
+**Key Functions:**
+- `addLiquidity()` / `removeLiquidity()`: LP liquidity management (contracts/HubPool.sol:449, 476)
+- `proposeRootBundle()`: Data worker submits merkle roots (contracts/HubPool.sol:560)
+- `executeRootBundle()`: Executes pool rebalances and relays roots to SpokePools (contracts/HubPool.sol:612)
+- `disputeRootBundle()`: Challenge invalid proposals during liveness period (contracts/HubPool.sol:715)
+- `relaySpokePoolAdminFunction()`: Send admin messages to SpokePools (contracts/HubPool.sol:249)
+
+### SpokePool (Each L2/Sidechain)
+
+SpokePools are deployed on every supported chain and handle:
+
+- **User Deposits**: Accept tokens from depositors initiating cross-chain transfers
+- **Relayer Fills**: Allow relayers to fulfill deposits by sending tokens to recipients
+- **Merkle Leaf Execution**: Process relayer refunds and slow fills using merkle proofs
+- **Cross-Chain Messages**: Receive root bundles and admin functions from HubPool
+
+<CodeGroup>
+```solidity contracts/SpokePool.sol
+/**
+ * @title SpokePool
+ * @notice Base contract deployed on source and destination chains enabling depositors
+ * to transfer assets from source to destination.
+ */
+abstract contract SpokePool is
+    V3SpokePoolInterface,
+    SpokePoolInterface,
+    UUPSUpgradeable,
+    ReentrancyGuardUpgradeable,
+    MultiCallerUpgradeable,
+    EIP712CrossChainUpgradeable
+{
+    // Cross-chain ownership
+    address public crossDomainAdmin;
+    address public withdrawalRecipient;
+    
+    // Deposit tracking
+    uint32 public numberOfDeposits;
+    
+    // Root bundles from HubPool
+    RootBundle[] public rootBundles;
+    
+    // Fill status tracking
+    mapping(bytes32 => uint256) public fillStatuses;
+}
+```
+</CodeGroup>
+
+**Key Functions:**
+- `deposit()` / `depositV3()`: User initiates cross-chain transfer (contracts/SpokePool.sol:501, 579)
+- `fillRelay()`: Relayer fulfills deposit on destination chain
+- `relayRootBundle()`: Receive merkle roots from HubPool (contracts/SpokePool.sol:343)
+- `executeRelayerRefundLeaf()`: Relayer claims refund with merkle proof
+- `executeSlowRelayLeaf()`: Protocol fulfills deposit from reserves
+
+**UUPS Upgradeability**: All SpokePools are UUPS upgradeable proxies, allowing implementation updates while preserving storage and addresses. The upgrade authority is the HubPool via cross-chain messages.
+
+### Chain Adapters
+
+Chain adapters are stateless contracts called via `delegatecall` from the HubPool to bridge tokens and relay messages to each L2. Located in `contracts/chain-adapters/`.
+
+**Purpose:**
+- Wrap each chain's native bridge (Arbitrum Inbox, OP Stack messenger, Polygon FxPortal, etc.)
+- Provide a unified interface for cross-chain communication
+- Support multiple bridge types: native bridges, CCTP, LayerZero OFT, Wormhole
+
+**Execution Flow:**
+```solidity
+// HubPool delegates to adapter to send tokens
+(bool success, ) = adapter.delegatecall(
+    abi.encodeWithSignature(
+        "relayTokens(address,address,uint256,address)",
+        l1Token,
+        l2Token,
+        amount,
+        spokePool
+    )
+);
+```
+
+## Supported Chains
+
+Across Protocol supports numerous chains through chain-specific SpokePool implementations:
+
+<CardGroup cols={3}>
+  <Card title="Arbitrum" icon="bridge">
+    `Arbitrum_SpokePool.sol`
+  </Card>
+  <Card title="Optimism" icon="bridge">
+    `Optimism_SpokePool.sol`
+  </Card>
+  <Card title="OP Stack" icon="bridge">
+    `OP_SpokePool.sol`
+  </Card>
+  <Card title="Polygon" icon="bridge">
+    `Polygon_SpokePool.sol`
+  </Card>
+  <Card title="Polygon zkEVM" icon="bridge">
+    `PolygonZkEVM_SpokePool.sol`
+  </Card>
+  <Card title="ZkSync" icon="bridge">
+    `ZkSync_SpokePool.sol`
+  </Card>
+  <Card title="Base" icon="bridge">
+    Uses `OP_SpokePool.sol`
+  </Card>
+  <Card title="Linea" icon="bridge">
+    `Linea_SpokePool.sol`
+  </Card>
+  <Card title="Scroll" icon="bridge">
+    `Scroll_SpokePool.sol`
+  </Card>
+  <Card title="Blast" icon="bridge">
+    `Blast_SpokePool.sol`
+  </Card>
+  <Card title="Boba" icon="bridge">
+    `Boba_SpokePool.sol`
+  </Card>
+  <Card title="Ethereum" icon="bridge">
+    `Ethereum_SpokePool.sol`
+  </Card>
+  <Card title="Lisk" icon="bridge">
+    `Lisk_SpokePool.sol`
+  </Card>
+  <Card title="World Chain" icon="bridge">
+    `WorldChain_SpokePool.sol`
+  </Card>
+  <Card title="Lens" icon="bridge">
+    `Lens_SpokePool.sol`
+  </Card>
+  <Card title="Ink" icon="bridge">
+    `Ink_SpokePool.sol`
+  </Card>
+  <Card title="Cher" icon="bridge">
+    `Cher_SpokePool.sol`
+  </Card>
+  <Card title="Universal" icon="bridge">
+    `Universal_SpokePool.sol`
+  </Card>
+</CardGroup>
+
+Each chain-specific SpokePool inherits from the base `SpokePool.sol` contract and overrides the `_requireAdminSender()` function to implement chain-specific admin verification logic.
+
+## Security Model
+
+<AccordionGroup>
+  <Accordion title="Optimistic Verification">
+    The protocol uses optimistic verification with a challenge period (default 2 hours) where proposed root bundles can be disputed. If a dispute occurs, UMA's Optimistic Oracle resolves it.
+  </Accordion>
+  
+  <Accordion title="UUPS Upgrades">
+    All SpokePools use the UUPS (Universal Upgradeable Proxy Standard) pattern, allowing logic upgrades without changing contract addresses or storage. Only the HubPool can authorize upgrades.
+  </Accordion>
+  
+  <Accordion title="Cross-Chain Ownership">
+    The HubPool on Ethereum L1 owns all SpokePool contracts across all chains. Admin functions are relayed cross-chain via chain adapters with proper verification.
+  </Accordion>
+  
+  <Accordion title="Bond Mechanism">
+    Data workers must stake a bond when proposing root bundles. Bonds are slashed if proposals are invalid and returned after successful execution.
+  </Accordion>
+</AccordionGroup>
+
+## Development Frameworks
+
+<CardGroup cols={2}>
+  <Card title="Foundry" icon="hammer">
+    **Primary framework** for new tests and deployment scripts. Use `FOUNDRY_PROFILE=local-test` for testing.
+  </Card>
+  <Card title="Hardhat" icon="code">
+    **Legacy framework** for older tests. The codebase is migrating to Foundry.
+  </Card>
+</CardGroup>
+
+## Project Structure
+
+```
+contracts/
+├── HubPool.sol              # Central L1 contract
+├── SpokePool.sol            # Base spoke pool contract
+├── Arbitrum_SpokePool.sol   # Chain-specific implementations
+├── Optimism_SpokePool.sol
+├── ...
+├── chain-adapters/          # Cross-chain bridge adapters
+├── interfaces/              # Contract interfaces
+└── libraries/               # Shared libraries (MerkleLib, etc.)
+
+test/evm/
+├── foundry/                 # Foundry tests
+│   ├── local/              # Unit tests
+│   └── fork/               # Fork tests
+└── hardhat/                # Legacy Hardhat tests
+
+script/                      # Deployment scripts
+└── utils/                  # Deployment utilities
+```
+
+## Related Documentation
+
+<CardGroup cols={2}>
+  <Card title="Hub-and-Spoke Model" icon="network-wired" href="/concepts/hub-and-spoke">
+    Learn about the hub-and-spoke architecture in detail
+  </Card>
+  <Card title="Protocol Flow" icon="diagram-project" href="/concepts/protocol-flow">
+    Understand the complete flow from deposit to refund
+  </Card>
+  <Card title="Roles" icon="users" href="/concepts/roles">
+    Explore the different participant roles in the protocol
+  </Card>
+</CardGroup>

@@ -1,0 +1,496 @@
+---
+title: "Hub-and-Spoke Model"
+description: "Deep dive into Across Protocol's hub-and-spoke architecture with HubPool on L1 and SpokePools on L2s"
+---
+
+## What is Hub-and-Spoke?
+
+Across Protocol uses a **hub-and-spoke model** where:
+
+- **Hub (HubPool)**: Central contract on Ethereum L1 that manages liquidity, validates transfers, and owns all spoke contracts
+- **Spokes (SpokePools)**: Lightweight contracts on each supported chain that handle deposits and fills
+
+This architecture centralizes complex logic and liquidity on L1 while keeping L2 contracts simple and gas-efficient.
+
+## HubPool: The Central Hub on L1
+
+### Core Responsibilities
+
+The HubPool on Ethereum L1 serves as the protocol's control center:
+
+<CardGroup cols={2}>
+  <Card title="Liquidity Pool" icon="droplet">
+    Accepts deposits from LPs who earn fees for providing capital to fund relayer refunds.
+  </Card>
+  <Card title="Validation Engine" icon="shield-check">
+    Validates cross-chain transfers using merkle root bundles with optimistic verification.
+  </Card>
+  <Card title="Pool Rebalancer" icon="arrows-rotate">
+    Coordinates token distribution across all SpokePools via chain adapters.
+  </Card>
+  <Card title="Cross-Chain Owner" icon="crown">
+    Owns and administers all SpokePool contracts across all chains.
+  </Card>
+</CardGroup>
+
+### Liquidity Management
+
+The HubPool manages liquidity for all supported tokens:
+
+<CodeGroup>
+```solidity LP Deposits
+/**
+ * @notice Deposit liquidity into this contract to earn LP fees.
+ * @notice Caller will receive an LP token representing their share of this pool.
+ */
+function addLiquidity(address l1Token, uint256 l1TokenAmount) 
+    public 
+    payable 
+    override 
+    nonReentrant 
+    unpaused 
+{
+    require(pooledTokens[l1Token].isEnabled, "Token not enabled");
+    require(((address(weth) == l1Token) && msg.value == l1TokenAmount) || msg.value == 0, "Bad msg.value");
+
+    uint256 lpTokensToMint = (l1TokenAmount * 1e18) / _exchangeRateCurrent(l1Token);
+    pooledTokens[l1Token].liquidReserves += l1TokenAmount;
+    ExpandedIERC20(pooledTokens[l1Token].lpToken).mint(msg.sender, lpTokensToMint);
+
+    if (address(weth) == l1Token && msg.value > 0) 
+        WETH9Interface(address(l1Token)).deposit{ value: msg.value }();
+    else 
+        IERC20(l1Token).safeTransferFrom(msg.sender, address(this), l1TokenAmount);
+
+    emit LiquidityAdded(l1Token, l1TokenAmount, lpTokensToMint, msg.sender);
+}
+```
+
+```solidity LP Withdrawals
+/**
+ * @notice Burns LP share to redeem for underlying l1Token.
+ */
+function removeLiquidity(
+    address l1Token,
+    uint256 lpTokenAmount,
+    bool sendEth
+) public override nonReentrant unpaused {
+    require(address(weth) == l1Token || !sendEth, "Cant send eth");
+    uint256 l1TokensToReturn = (lpTokenAmount * _exchangeRateCurrent(l1Token)) / 1e18;
+
+    ExpandedIERC20(pooledTokens[l1Token].lpToken).burnFrom(msg.sender, lpTokenAmount);
+    pooledTokens[l1Token].liquidReserves -= l1TokensToReturn;
+
+    if (sendEth) {
+        weth.withdraw(l1TokensToReturn);
+        Address.sendValue(payable(msg.sender), l1TokensToReturn);
+    } else {
+        IERC20(address(l1Token)).safeTransfer(msg.sender, l1TokensToReturn);
+    }
+    emit LiquidityRemoved(l1Token, l1TokensToReturn, lpTokenAmount, msg.sender);
+}
+```
+
+```solidity Exchange Rate
+/**
+ * @notice Returns exchange rate of L1 token to LP token.
+ * @return Amount of L1 tokens redeemable for 1 unit LP token.
+ */
+function exchangeRateCurrent(address l1Token) public override nonReentrant returns (uint256) {
+    return _exchangeRateCurrent(l1Token);
+}
+
+function _exchangeRateCurrent(address l1Token) internal returns (uint256) {
+    PooledToken storage pooledToken = pooledTokens[l1Token];
+    uint256 lpTokenTotalSupply = IERC20(pooledToken.lpToken).totalSupply();
+    if (lpTokenTotalSupply == 0) return 1e18; // initial rate is 1:1
+
+    _updateAccumulatedLpFees(pooledToken);
+    _sync(l1Token);
+
+    // ExchangeRate := (liquidReserves + utilizedReserves - undistributedLpFees) / lpTokenSupply
+    int256 numerator = int256(pooledToken.liquidReserves) +
+        pooledToken.utilizedReserves -
+        int256(pooledToken.undistributedLpFees);
+    return (uint256(numerator) * 1e18) / lpTokenTotalSupply;
+}
+```
+</CodeGroup>
+
+**Key Concepts:**
+- **Liquid Reserves**: Tokens available in the HubPool for immediate use
+- **Utilized Reserves**: Tokens sent to SpokePools for relayer refunds
+- **LP Fee Rate**: Continuous fee distribution using exponential decay (0.0000015e18 per second)
+- **Exchange Rate**: LP token value increases over time as fees accrue
+
+### Root Bundle Validation
+
+The HubPool uses merkle trees to validate cross-chain activity:
+
+<CodeGroup>
+```solidity Propose Bundle
+/**
+ * @notice Publish a new root bundle. Caller stakes a bond that can be slashed
+ * if the proposal is invalid.
+ */
+function proposeRootBundle(
+    uint256[] calldata bundleEvaluationBlockNumbers,
+    uint8 poolRebalanceLeafCount,
+    bytes32 poolRebalanceRoot,
+    bytes32 relayerRefundRoot,
+    bytes32 slowRelayRoot
+) public override nonReentrant noActiveRequests unpaused {
+    require(poolRebalanceLeafCount > 0, "Bundle must have at least 1 leaf");
+
+    uint32 challengePeriodEndTimestamp = uint32(getCurrentTime()) + liveness;
+
+    delete rootBundleProposal;
+
+    rootBundleProposal.challengePeriodEndTimestamp = challengePeriodEndTimestamp;
+    rootBundleProposal.unclaimedPoolRebalanceLeafCount = poolRebalanceLeafCount;
+    rootBundleProposal.poolRebalanceRoot = poolRebalanceRoot;
+    rootBundleProposal.relayerRefundRoot = relayerRefundRoot;
+    rootBundleProposal.slowRelayRoot = slowRelayRoot;
+    rootBundleProposal.proposer = msg.sender;
+
+    bondToken.safeTransferFrom(msg.sender, address(this), bondAmount);
+
+    emit ProposeRootBundle(
+        challengePeriodEndTimestamp,
+        poolRebalanceLeafCount,
+        bundleEvaluationBlockNumbers,
+        poolRebalanceRoot,
+        relayerRefundRoot,
+        slowRelayRoot,
+        msg.sender
+    );
+}
+```
+
+```solidity Execute Bundle
+/**
+ * @notice Executes a pool rebalance leaf. Bridges tokens to SpokePools and
+ * publishes relayer refund and slow relay roots.
+ */
+function executeRootBundle(
+    uint256 chainId,
+    uint256 groupIndex,
+    uint256[] memory bundleLpFees,
+    int256[] memory netSendAmounts,
+    int256[] memory runningBalances,
+    uint8 leafId,
+    address[] memory l1Tokens,
+    bytes32[] calldata proof
+) public nonReentrant unpaused {
+    require(getCurrentTime() > rootBundleProposal.challengePeriodEndTimestamp, "Not passed liveness");
+    require(!MerkleLib.isClaimed1D(rootBundleProposal.claimedBitMap, leafId), "Already claimed");
+
+    require(
+        MerkleLib.verifyPoolRebalance(
+            rootBundleProposal.poolRebalanceRoot,
+            PoolRebalanceLeaf({
+                chainId: chainId,
+                groupIndex: groupIndex,
+                bundleLpFees: bundleLpFees,
+                netSendAmounts: netSendAmounts,
+                runningBalances: runningBalances,
+                leafId: leafId,
+                l1Tokens: l1Tokens
+            }),
+            proof
+        ),
+        "Bad Proof"
+    );
+
+    (address adapter, address spokePool) = _getInitializedCrossChainContracts(chainId);
+
+    rootBundleProposal.claimedBitMap = MerkleLib.setClaimed1D(rootBundleProposal.claimedBitMap, leafId);
+    --rootBundleProposal.unclaimedPoolRebalanceLeafCount;
+
+    _sendTokensToChainAndUpdatePooledTokenTrackers(
+        adapter,
+        spokePool,
+        chainId,
+        l1Tokens,
+        netSendAmounts,
+        bundleLpFees
+    );
+
+    if (groupIndex == 0) {
+        (bool success, ) = adapter.delegatecall(
+            abi.encodeWithSignature(
+                "relayMessage(address,bytes)",
+                spokePool,
+                abi.encodeWithSignature(
+                    "relayRootBundle(bytes32,bytes32)",
+                    rootBundleProposal.relayerRefundRoot,
+                    rootBundleProposal.slowRelayRoot
+                )
+            )
+        );
+        require(success, "delegatecall failed");
+    }
+
+    if (rootBundleProposal.unclaimedPoolRebalanceLeafCount == 0)
+        bondToken.safeTransfer(rootBundleProposal.proposer, bondAmount);
+
+    emit RootBundleExecuted(groupIndex, leafId, chainId, l1Tokens, bundleLpFees, netSendAmounts, runningBalances, msg.sender);
+}
+```
+</CodeGroup>
+
+**Three Merkle Trees:**
+1. **Pool Rebalance Root**: Instructions for sending tokens from HubPool to SpokePools
+2. **Relayer Refund Root**: Merkle proofs for relayer refunds on each chain
+3. **Slow Relay Root**: Merkle proofs for slow fills when no relayer filled the deposit
+
+## SpokePools: Lightweight Spokes on L2s
+
+### Core Responsibilities
+
+SpokePools on each chain are responsible for:
+
+<Steps>
+  <Step title="Accept Deposits">
+    Users lock tokens in the SpokePool and emit a `FundsDeposited` event that relayers monitor.
+  </Step>
+  <Step title="Process Fills">
+    Relayers call `fillRelay()` to send tokens to recipients and record the fill.
+  </Step>
+  <Step title="Receive Root Bundles">
+    Accept merkle roots from HubPool containing refund and slow fill instructions.
+  </Step>
+  <Step title="Execute Merkle Leaves">
+    Process relayer refunds and slow fills using merkle proofs.
+  </Step>
+</Steps>
+
+### Deposit Flow
+
+<CodeGroup>
+```solidity Deposit Function
+/**
+ * @notice Request to bridge input token cross chain to a destination chain.
+ */
+function deposit(
+    bytes32 depositor,
+    bytes32 recipient,
+    bytes32 inputToken,
+    bytes32 outputToken,
+    uint256 inputAmount,
+    uint256 outputAmount,
+    uint256 destinationChainId,
+    bytes32 exclusiveRelayer,
+    uint32 quoteTimestamp,
+    uint32 fillDeadline,
+    uint32 exclusivityParameter,
+    bytes calldata message
+) public payable override nonReentrant unpausedDeposits {
+    DepositV3Params memory params = DepositV3Params({
+        depositor: depositor,
+        recipient: recipient,
+        inputToken: inputToken,
+        outputToken: outputToken,
+        inputAmount: inputAmount,
+        outputAmount: outputAmount,
+        destinationChainId: destinationChainId,
+        exclusiveRelayer: exclusiveRelayer,
+        depositId: numberOfDeposits++,
+        quoteTimestamp: quoteTimestamp,
+        fillDeadline: fillDeadline,
+        exclusivityParameter: exclusivityParameter,
+        message: message
+    });
+    _depositV3(params);
+}
+```
+
+```solidity Relay Root Bundle
+/**
+ * @notice Stores a new root bundle that can be executed to refund relayers
+ * and fulfill slow relays.
+ */
+function relayRootBundle(
+    bytes32 relayerRefundRoot, 
+    bytes32 slowRelayRoot
+) public override onlyAdmin nonReentrant {
+    uint32 rootBundleId = uint32(rootBundles.length);
+    RootBundle storage rootBundle = rootBundles.push();
+    rootBundle.relayerRefundRoot = relayerRefundRoot;
+    rootBundle.slowRelayRoot = slowRelayRoot;
+    emit RelayedRootBundle(rootBundleId, relayerRefundRoot, slowRelayRoot);
+}
+```
+</CodeGroup>
+
+**Key Features:**
+- **Lightweight**: Minimal logic to reduce gas costs on L2s
+- **Event-Driven**: Deposits emit events that off-chain relayers monitor
+- **Merkle Proofs**: Refunds and slow fills use merkle proofs to validate against roots
+- **Pausable**: Admin can pause deposits or fills in emergencies
+
+## Cross-Chain Ownership
+
+The HubPool on L1 owns all SpokePool contracts across all chains through a cross-chain ownership model:
+
+<Steps>
+  <Step title="Admin Function Call">
+    HubPool owner calls `relaySpokePoolAdminFunction(chainId, functionData)` on HubPool.
+  </Step>
+  <Step title="Chain Adapter Delegation">
+    HubPool delegates to the appropriate chain adapter via `delegatecall`.
+  </Step>
+  <Step title="Cross-Chain Message">
+    Adapter sends message through the chain's native bridge (Arbitrum Inbox, OP Messenger, etc.).
+  </Step>
+  <Step title="Admin Verification">
+    SpokePool's `_requireAdminSender()` verifies the message came from HubPool.
+  </Step>
+  <Step title="Function Execution">
+    SpokePool executes the admin function (upgrade, pause, configure, etc.).
+  </Step>
+</Steps>
+
+<CodeGroup>
+```solidity HubPool Admin Relay
+/**
+ * @notice Sends message to SpokePool from this contract. Callable only by owner.
+ */
+function relaySpokePoolAdminFunction(
+    uint256 chainId,
+    bytes memory functionData
+) public override onlyOwner nonReentrant {
+    _relaySpokePoolAdminFunction(chainId, functionData);
+}
+
+function _relaySpokePoolAdminFunction(uint256 chainId, bytes memory functionData) internal {
+    (address adapter, address spokePool) = _getInitializedCrossChainContracts(chainId);
+    
+    (bool success, ) = adapter.delegatecall(
+        abi.encodeWithSignature(
+            "relayMessage(address,bytes)",
+            spokePool,
+            functionData
+        )
+    );
+    require(success, "delegatecall failed");
+    
+    emit SpokePoolAdminFunctionTriggered(chainId, functionData);
+}
+```
+
+```solidity SpokePool Admin Check (Arbitrum)
+// contracts/Arbitrum_SpokePool.sol
+/**
+ * @notice Verifies caller is L1 HubPool via address aliasing.
+ */
+function _requireAdminSender() internal view override {
+    require(
+        msg.sender == AddressAliasHelper.applyL1ToL2Alias(crossDomainAdmin),
+        "Caller is not admin"
+    );
+}
+```
+
+```solidity SpokePool Admin Check (Optimism)
+// contracts/Optimism_SpokePool.sol  
+/**
+ * @notice Verifies caller is L1 HubPool via CrossDomainMessenger.
+ */
+function _requireAdminSender() internal view override {
+    require(
+        msg.sender == address(MESSENGER) && 
+        MESSENGER.xDomainMessageSender() == crossDomainAdmin,
+        "Caller is not admin"
+    );
+}
+```
+</CodeGroup>
+
+**Chain-Specific Verification:**
+- **Arbitrum**: Uses address aliasing (`AddressAliasHelper.applyL1ToL2Alias()`)
+- **Optimism/Base**: Verifies via `CrossDomainMessenger.xDomainMessageSender()`
+- **Polygon**: Checks `FxChild.processMessageFromRoot()`
+- **zkSync**: Validates via zkSync bridge messaging
+
+### UUPS Upgrades
+
+All SpokePools use UUPS (Universal Upgradeable Proxy Standard) for upgrades:
+
+<CodeGroup>
+```solidity Upgrade Authorization
+/**
+ * @notice Called by {upgradeTo} and {upgradeToAndCall}.
+ * @dev Only admin can authorize upgrades.
+ */
+function _authorizeUpgrade(address newImplementation) internal override onlyAdmin {}
+
+modifier onlyAdmin() {
+    _requireAdminSender();
+    _;
+}
+```
+</CodeGroup>
+
+**Upgrade Process:**
+1. Deploy new SpokePool implementation
+2. Call `relaySpokePoolAdminFunction()` on HubPool with `upgradeTo(newImplementation)`
+3. Message bridges to L2 via chain adapter
+4. SpokePool verifies admin and upgrades to new implementation
+5. Storage and address remain unchanged
+
+## Pool Rebalancing
+
+The hub-and-spoke model enables efficient pool rebalancing:
+
+<Accordion title="Why Rebalancing is Needed">
+  Relayers fill deposits on destination chains using their own capital. The HubPool must periodically send tokens to SpokePools to refund relayers. This process is called "pool rebalancing."
+</Accordion>
+
+<Accordion title="How It Works">
+  1. Data worker monitors all chains and calculates net token flows
+  2. Data worker proposes a root bundle with pool rebalance leaves
+  3. After challenge period, HubPool executes leaves to send tokens to SpokePools
+  4. Relayers claim refunds on their chosen chains using merkle proofs
+</Accordion>
+
+<Accordion title="Optimization">
+  Net flow calculation means tokens only move when needed. If a chain has excess tokens, they can be sent back to HubPool or redirected to deficit chains.
+</Accordion>
+
+## Benefits of Hub-and-Spoke
+
+<CardGroup cols={2}>
+  <Card title="Centralized Liquidity" icon="vault">
+    All LP capital pooled on L1 for maximum capital efficiency. No fragmentation across chains.
+  </Card>
+  <Card title="Simplified L2 Logic" icon="code-simple">
+    SpokePools are lightweight with minimal logic, reducing gas costs and attack surface.
+  </Card>
+  <Card title="Unified Governance" icon="gavel">
+    Single point of control on L1 for all protocol parameters and upgrades.
+  </Card>
+  <Card title="Optimistic Verification" icon="shield-check">
+    Challenge period on L1 ensures security without expensive on-chain verification.
+  </Card>
+  <Card title="Flexible Scaling" icon="arrows-maximize">
+    Easy to add new chains by deploying a SpokePool and chain adapter.
+  </Card>
+  <Card title="Efficient Rebalancing" icon="rotate">
+    Net flow calculations minimize unnecessary token transfers.
+  </Card>
+</CardGroup>
+
+## Related Documentation
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Overview of the complete system architecture
+  </Card>
+  <Card title="Protocol Flow" icon="arrows-turn-right" href="/concepts/protocol-flow">
+    Step-by-step guide through the protocol flow
+  </Card>
+  <Card title="Roles" icon="users" href="/concepts/roles">
+    Learn about different participants in the protocol
+  </Card>
+</CardGroup>

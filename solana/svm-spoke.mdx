@@ -1,0 +1,626 @@
+---
+title: "SVM Spoke Program"
+description: "Core Solana spoke pool program for cross-chain token deposits, fills, and relayer refunds"
+---
+
+## Overview
+
+The `svm_spoke` program is the core implementation of Across Protocol's spoke pool on Solana. It is functionally equivalent to `SpokePool.sol` on EVM chains, adapted for the Solana Virtual Machine using the Anchor framework.
+
+**Program ID**: `DLv3NggMiSaef97YCkew5xKUHDh13tVGZ7tydt3ZeAru`
+
+## Architecture
+
+The SVM Spoke program manages the complete lifecycle of cross-chain token transfers:
+
+- **Deposits** - Users initiate cross-chain transfers
+- **Fills** - Relayers fulfill deposits on destination chains
+- **Bundles** - Execute merkle root bundles from HubPool
+- **Refunds** - Process relayer refunds via merkle proofs
+- **Rebalancing** - Bridge tokens back to HubPool
+
+## State Management
+
+### State Account
+
+The main program state is stored in a PDA (Program Derived Address) with seed `["state", seed]`:
+
+```rust
+#[account]
+pub struct State {
+    pub paused_deposits: bool,          // Tracks if deposits are paused
+    pub paused_fills: bool,             // Tracks if fills are paused
+    pub owner: Pubkey,                  // Admin with local privileges
+    pub seed: u64,                      // Seed for PDA derivation (0 on mainnet)
+    pub number_of_deposits: u32,        // Auto-incrementing deposit counter
+    pub chain_id: u64,                  // Across chain ID for Solana
+    pub current_time: u32,              // Test mode only (0 on mainnet)
+    pub remote_domain: u32,             // CCTP domain for Ethereum (0)
+    pub cross_domain_admin: Pubkey,     // HubPool address on Ethereum
+    pub root_bundle_id: u32,            // Next root bundle ID counter
+    pub deposit_quote_time_buffer: u32, // Quote timestamp validation buffer
+    pub fill_deadline_buffer: u32,      // Fill deadline validation buffer
+}
+```
+
+### Vault Accounts
+
+Each supported token has an associated token account (ATA) that serves as the program's vault:
+
+- **Authority**: State PDA
+- **Seed**: Standard ATA derivation
+- **Purpose**: Hold deposited tokens and fund slow fills
+
+## Core Instructions
+
+### Initialization
+
+<CodeGroup>
+```rust Program Instruction
+pub fn initialize(
+    ctx: Context<Initialize>,
+    seed: u64,
+    initial_number_of_deposits: u32,
+    chain_id: u64,
+    remote_domain: u32,
+    cross_domain_admin: Pubkey,
+    deposit_quote_time_buffer: u32,
+    fill_deadline_buffer: u32,
+) -> Result<()>
+```
+
+```bash CLI Command
+anchor run initialize \
+  --provider.cluster $RPC_URL \
+  --provider.wallet $KEYPAIR -- \
+  --chainId $SVM_CHAIN_ID \
+  --remoteDomain 0 \
+  --crossDomainAdmin $HUB_POOL \
+  --svmAdmin $MULTISIG \
+  --depositQuoteTimeBuffer 3600 \
+  --fillDeadlineBuffer 21600
+```
+</CodeGroup>
+
+Initializes the state for the SVM Spoke Pool. Only callable once.
+
+**Parameters**:
+- `seed` - PDA seed, must be 0 on mainnet
+- `initial_number_of_deposits` - Starting deposit counter (for upgrades)
+- `chain_id` - Solana chain identifier in Across protocol
+- `remote_domain` - CCTP domain for Ethereum (0)
+- `cross_domain_admin` - HubPool contract address
+- `deposit_quote_time_buffer` - Max age for quote timestamps (seconds)
+- `fill_deadline_buffer` - Max future time for fill deadlines (seconds)
+
+### Create Vault
+
+<CodeGroup>
+```bash CLI Command
+export MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v # USDC on mainnet
+anchor run createVault \
+  --provider.cluster $RPC_URL \
+  --provider.wallet $KEYPAIR -- \
+  --originToken $MINT
+```
+</CodeGroup>
+
+Creates a token vault (ATA) for accepting deposits in a specific token.
+
+### Deposits
+
+#### Standard Deposit
+
+```rust
+pub fn deposit(
+    ctx: Context<Deposit>,
+    depositor: Pubkey,
+    recipient: Pubkey,
+    input_token: Pubkey,
+    output_token: Pubkey,
+    input_amount: u64,
+    output_amount: [u8; 32],
+    destination_chain_id: u64,
+    exclusive_relayer: Pubkey,
+    quote_timestamp: u32,
+    fill_deadline: u32,
+    exclusivity_parameter: u32,
+    message: Vec<u8>,
+) -> Result<()>
+```
+
+Initiates a cross-chain token transfer.
+
+**Key Parameters**:
+
+- `depositor` - Account credited with the deposit
+- `recipient` - Destination chain recipient (bytes32 format)
+- `input_token` - Token to lock on Solana
+- `output_token` - Token to receive on destination
+- `input_amount` - Amount to lock (will be refunded to relayer)
+- `output_amount` - Amount relayer sends to recipient (big-endian bytes32)
+- `destination_chain_id` - Target chain for the fill
+- `exclusive_relayer` - Optional exclusive relayer address
+- `quote_timestamp` - HubPool timestamp for fee calculation
+- `fill_deadline` - Deadline for filling (timestamp)
+- `exclusivity_parameter` - Exclusivity period config
+- `message` - Optional message for recipient contract
+
+**Example**:
+
+```typescript
+import { AnchorProvider, Program } from "@coral-xyz/anchor";
+import { PublicKey } from "@solana/web3.js";
+import { SvmSpoke } from "./target/types/svm_spoke";
+
+const program = anchor.workspace.SvmSpoke as Program<SvmSpoke>;
+
+await program.methods
+  .deposit(
+    depositor.publicKey,
+    recipientAddress,
+    usdcMint,
+    outputToken,
+    new anchor.BN(1_000_000), // 1 USDC (6 decimals)
+    outputAmountBytes32,
+    destinationChainId,
+    PublicKey.default, // No exclusive relayer
+    Math.floor(Date.now() / 1000),
+    Math.floor(Date.now() / 1000) + 21600, // 6 hour deadline
+    0, // No exclusivity
+    [] // No message
+  )
+  .accounts({
+    signer: depositor.publicKey,
+    state: statePDA,
+    depositorTokenAccount: depositorATA,
+    vault: vaultATA,
+    mint: usdcMint,
+    delegate: delegatePDA,
+    tokenProgram: TOKEN_PROGRAM_ID,
+    associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+    systemProgram: SystemProgram.programId,
+  })
+  .rpc();
+```
+
+#### Deposit Now
+
+```rust
+pub fn deposit_now(
+    ctx: Context<Deposit>,
+    // ... same params except:
+    fill_deadline_offset: u32,  // Replaces quote_timestamp and fill_deadline
+) -> Result<()>
+```
+
+Convenience method that automatically sets `quote_timestamp` to current time and calculates `fill_deadline` as current time + offset.
+
+#### Unsafe Deposit
+
+```rust
+pub fn unsafe_deposit(
+    ctx: Context<Deposit>,
+    // ... same params plus:
+    deposit_nonce: u64,  // Custom nonce instead of auto-increment
+) -> Result<()>
+```
+
+Allows deterministic deposit IDs by using a custom nonce instead of the global counter. Useful for pre-computing deposit IDs.
+
+**Deposit ID Calculation**:
+```rust
+// Standard deposit: Uses state.number_of_deposits counter
+deposit_id = [0u8; 28] + state.number_of_deposits.to_be_bytes()
+
+// Unsafe deposit: Hash of signer, depositor, and nonce
+deposit_id = keccak256(signer || depositor || deposit_nonce)
+```
+
+### Fill Relay
+
+```rust
+pub fn fill_relay<'info>(
+    ctx: Context<'_, '_, '_, 'info, FillRelay<'info>>,
+    relay_hash: [u8; 32],
+    relay_data: Option<RelayData>,
+    repayment_chain_id: Option<u64>,
+    repayment_address: Option<Pubkey>,
+) -> Result<()>
+```
+
+Fulfills a cross-chain deposit by sending tokens to the recipient. Only callable on the destination chain specified in the original deposit.
+
+**RelayData Structure**:
+```rust
+pub struct RelayData {
+    pub depositor: Pubkey,
+    pub recipient: Pubkey,
+    pub input_token: Pubkey,
+    pub output_token: Pubkey,
+    pub input_amount: [u8; 32],
+    pub output_amount: u64,
+    pub origin_chain_id: u64,
+    pub exclusive_relayer: Pubkey,
+    pub fill_deadline: u32,
+    pub exclusivity_deadline: u32,
+    pub message: Vec<u8>,
+}
+```
+
+**Relay Hash Computation**:
+```rust
+relay_hash = keccak256(
+    serialize(relay_data) || destination_chain_id
+)
+```
+
+**Example**:
+```typescript
+// Relayer fills deposit on Solana
+await program.methods
+  .fillRelay(
+    relayHashBuffer,
+    relayData,
+    repaymentChainId,
+    relayerRefundAddress
+  )
+  .accounts({
+    signer: relayer.publicKey,
+    instructionParams: program.programId, // None
+    state: statePDA,
+    mint: outputMint,
+    relayerTokenAccount: relayerATA,
+    recipientTokenAccount: recipientATA,
+    fillStatus: fillStatusPDA,
+    delegate: delegatePDA,
+    // ...
+  })
+  .rpc();
+```
+
+### Root Bundle Execution
+
+#### Relay Root Bundle
+
+```rust
+pub fn relay_root_bundle(
+    ctx: Context<RelayRootBundle>,
+    relayer_refund_root: [u8; 32],
+    slow_relay_root: [u8; 32],
+) -> Result<()>
+```
+
+Stores a new root bundle relayed from HubPool via CCTP. Only callable by cross-domain admin.
+
+#### Execute Relayer Refund Leaf
+
+```rust
+pub fn execute_relayer_refund_leaf<'c, 'info>(
+    ctx: Context<'_, '_, 'c, 'info, ExecuteRelayerRefundLeaf<'info>>,
+) -> Result<()>
+```
+
+Executes a relayer refund leaf from a root bundle, verifying merkle proof inclusion.
+
+**Leaf Structure** (defined in [UMIP-179](https://github.com/UMAprotocol/UMIPs/blob/master/UMIPs/umip-179.md)):
+```rust
+pub struct RelayerRefundLeaf {
+    pub amount_to_return: u64,
+    pub chain_id: u64,
+    pub refund_amounts: Vec<u64>,
+    pub leaf_id: u64,
+    pub mint_public_key: Pubkey,
+    pub refund_addresses: Vec<Pubkey>,
+}
+```
+
+**Execution Modes**:
+
+1. **Direct Transfer** - `execute_relayer_refund_leaf()` - Transfers directly to relayer ATAs
+2. **Deferred Claims** - `execute_relayer_refund_leaf_deferred()` - Creates claimable accounts for blocked addresses
+
+#### Bridge Tokens to HubPool
+
+```rust
+pub fn bridge_tokens_to_hub_pool(
+    ctx: Context<BridgeTokensToHubPool>,
+    amount: u64
+) -> Result<()>
+```
+
+Bridges tokens from vault back to Ethereum HubPool via CCTP.
+
+### Slow Fills
+
+#### Request Slow Fill
+
+```rust
+pub fn request_slow_fill(
+    ctx: Context<RequestSlowFill>,
+    _relay_hash: [u8; 32],
+    relay_data: Option<RelayData>,
+) -> Result<()>
+```
+
+Requests a slow fill if no relayer has filled the deposit before the deadline.
+
+#### Execute Slow Relay Leaf
+
+```rust
+pub fn execute_slow_relay_leaf<'info>(
+    ctx: Context<'_, '_, '_, 'info, ExecuteSlowRelayLeaf<'info>>,
+    _relay_hash: [u8; 32],
+    slow_fill_leaf: Option<SlowFill>,
+    _root_bundle_id: Option<u32>,
+    proof: Option<Vec<[u8; 32]>>,
+) -> Result<()>
+```
+
+Executes a slow fill leaf from root bundle, sending tokens directly from the vault.
+
+## Admin Functions
+
+### Pause Controls
+
+```rust
+pub fn pause_deposits(ctx: Context<PauseDeposits>, pause: bool) -> Result<()>
+pub fn pause_fills(ctx: Context<PauseFills>, pause: bool) -> Result<()>
+```
+
+Emergency pause functionality for deposits and fills. Only callable by owner.
+
+### Ownership
+
+```rust
+pub fn transfer_ownership(
+    ctx: Context<TransferOwnership>,
+    new_owner: Pubkey
+) -> Result<()>
+```
+
+Transfers ownership to a new address.
+
+### Cross-Domain Admin
+
+```rust
+pub fn set_cross_domain_admin(
+    ctx: Context<SetCrossDomainAdmin>,
+    cross_domain_admin: Pubkey
+) -> Result<()>
+```
+
+Updates the HubPool address (for upgrades).
+
+### Emergency Bundle Deletion
+
+```rust
+pub fn emergency_delete_root_bundle(
+    ctx: Context<EmergencyDeleteRootBundleState>,
+    root_bundle_id: u32,
+) -> Result<()>
+```
+
+Deletes an invalid root bundle in emergencies.
+
+## CCTP Integration
+
+### Handle Receive Message
+
+```rust
+pub fn handle_receive_message<'info>(
+    ctx: Context<'_, '_, '_, 'info, HandleReceiveMessage<'info>>,
+    params: HandleReceiveMessageParams,
+) -> Result<()>
+```
+
+Permissioned entry point for cross-chain messages from Ethereum via CCTP Message Transmitter.
+
+**Authority PDA**: `["message_transmitter_authority", program_id]`
+
+This instruction:
+1. Validates the message sender is the HubPool
+2. Validates the remote domain is Ethereum
+3. Decodes the message body into a Solana instruction
+4. Executes the instruction via self-CPI
+
+## Deployment
+
+### Prerequisites
+
+```bash
+# Set environment variables
+export RPC_URL=https://api.mainnet-beta.solana.com
+export KEYPAIR=~/.config/solana/deployer.json
+export PROGRAM=svm_spoke
+export PROGRAM_ID=$(cat target/idl/$PROGRAM.json | jq -r ".address")
+export MULTISIG=<squads_vault_address>
+export SOLANA_VERSION=$(grep -A 2 'name = "solana-program"' Cargo.lock | grep 'version' | head -n 1 | cut -d'"' -f2)
+
+# For initialization
+export SVM_CHAIN_ID=$(cast to-dec $(cast shr $(cast shl $(cast keccak solana-mainnet) 208) 208))
+export HUB_POOL=0x14224e63716afAcE30C9a417E0542281869f7d9e # Mainnet HubPool
+export DEPOSIT_QUOTE_TIME_BUFFER=3600
+export FILL_DEADLINE_BUFFER=21600
+export MAX_LEN=$(( 2 * $(stat -c %s target/deploy/$PROGRAM.so) ))
+```
+
+### Build Verified Binary
+
+```bash
+unset IS_TEST
+yarn build-svm-solana-verify
+yarn generate-svm-artifacts
+```
+
+### Initial Deployment
+
+```bash
+# Deploy program
+solana program deploy \
+  --url $RPC_URL \
+  --keypair $KEYPAIR \
+  --program-id target/deploy/$PROGRAM-keypair.json \
+  --max-len $MAX_LEN \
+  --with-compute-unit-price 100000 \
+  --max-sign-attempts 100 \
+  --use-rpc \
+  target/deploy/$PROGRAM.so
+
+# Transfer upgrade authority to multisig
+solana program set-upgrade-authority \
+  --url $RPC_URL \
+  --keypair $KEYPAIR \
+  --skip-new-upgrade-authority-signer-check \
+  $PROGRAM_ID \
+  --new-upgrade-authority $MULTISIG
+
+# Upload IDL
+anchor idl init \
+  --provider.cluster $RPC_URL \
+  --provider.wallet $KEYPAIR \
+  --filepath target/idl/$PROGRAM.json \
+  $PROGRAM_ID
+
+anchor idl set-authority \
+  --provider.cluster $RPC_URL \
+  --provider.wallet $KEYPAIR \
+  --program-id $PROGRAM_ID \
+  --new-authority $MULTISIG
+
+# Initialize state
+anchor run initialize \
+  --provider.cluster $RPC_URL \
+  --provider.wallet $KEYPAIR -- \
+  --chainId $SVM_CHAIN_ID \
+  --remoteDomain 0 \
+  --crossDomainAdmin $HUB_POOL \
+  --svmAdmin $MULTISIG \
+  --depositQuoteTimeBuffer $DEPOSIT_QUOTE_TIME_BUFFER \
+  --fillDeadlineBuffer $FILL_DEADLINE_BUFFER
+
+# Create USDC vault
+export MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+anchor run createVault \
+  --provider.cluster $RPC_URL \
+  --provider.wallet $KEYPAIR -- \
+  --originToken $MINT
+```
+
+### Upgrades
+
+See [README SVM section](https://github.com/across-protocol/contracts#upgrades) for upgrade procedures using Squads multisig.
+
+### Verification
+
+```bash
+# Verify locally
+solana-verify verify-from-repo \
+  --url $RPC_URL \
+  --program-id $PROGRAM_ID \
+  --library-name $PROGRAM \
+  --base-image "solanafoundation/solana-verifiable-build:$SOLANA_VERSION" \
+  https://github.com/across-protocol/contracts
+
+# Upload verification (via multisig)
+solana-verify export-pda-tx \
+  --url $RPC_URL \
+  --program-id $PROGRAM_ID \
+  --library-name $PROGRAM \
+  --base-image "solanafoundation/solana-verifiable-build:$SOLANA_VERSION" \
+  --uploader $MULTISIG \
+  https://github.com/across-protocol/contracts
+```
+
+## Security Considerations
+
+### Known Limitations
+
+<Warning>
+The `svm-spoke` program does **not support** `speedUpDeposit` and `fillRelayWithUpdatedDeposit` due to cryptographic incompatibilities between Solana (Ed25519) and Ethereum (ECDSA secp256k1). Solana wallets cannot generate ECDSA signatures required for Ethereum verification.
+</Warning>
+
+### Access Control
+
+- **Owner** - Can pause, transfer ownership, relay bundles, and manage admin functions
+- **Cross-domain admin** - HubPool can execute admin functions via CCTP messages
+- **Anyone** - Can call deposit, fill, execute leaves, and other permissionless functions
+
+### Account Validation
+
+All accounts are validated using Anchor's constraint system:
+
+```rust
+#[account(
+    mut,
+    seeds = [b"state", state.seed.to_le_bytes().as_ref()],
+    bump,
+    constraint = !state.paused_deposits @ CommonError::DepositsArePaused
+)]
+pub state: Account<'info, State>,
+```
+
+## Events
+
+### FundsDeposited
+
+```rust
+#[event]
+pub struct FundsDeposited {
+    pub input_token: Pubkey,
+    pub output_token: Pubkey,
+    pub input_amount: u64,
+    pub output_amount: [u8; 32],
+    pub destination_chain_id: u64,
+    pub deposit_id: [u8; 32],
+    pub quote_timestamp: u32,
+    pub fill_deadline: u32,
+    pub exclusivity_deadline: u32,
+    pub depositor: Pubkey,
+    pub recipient: Pubkey,
+    pub exclusive_relayer: Pubkey,
+    pub message: Vec<u8>,
+}
+```
+
+### FilledRelay
+
+Emitted when a deposit is successfully filled.
+
+### RequestedSlowFill
+
+Emitted when a slow fill is requested.
+
+### ExecutedRelayerRefundRoot
+
+Emitted when relayer refunds are executed.
+
+## Testing
+
+```bash
+# Run all svm-spoke tests
+yarn test-svm
+
+# Test specific functions
+anchor test --skip-build --skip-deploy
+
+# Local validator for development
+solana-test-validator
+```
+
+## Resources
+
+<CardGroup cols={2}>
+  <Card title="Source Code" icon="github" href="https://github.com/across-protocol/contracts/tree/master/programs/svm-spoke">
+    View on GitHub
+  </Card>
+  <Card title="UMIP-179" icon="file-contract" href="https://github.com/UMAprotocol/UMIPs/blob/master/UMIPs/umip-179.md">
+    Bundle specification
+  </Card>
+  <Card title="Anchor Book" icon="anchor" href="https://book.anchor-lang.com/">
+    Anchor framework guide
+  </Card>
+  <Card title="Bug Bounty" icon="bug" href="https://docs.across.to/resources/bug-bounty">
+    Report security issues
+  </Card>
+</CardGroup>

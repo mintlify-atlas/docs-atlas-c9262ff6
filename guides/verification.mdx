@@ -1,0 +1,362 @@
+---
+title: 'Contract Verification'
+description: 'Verify Across Protocol contracts on Etherscan, Sourcify, and Solana explorers'
+---
+
+Contract verification allows users and developers to inspect source code on block explorers, increasing transparency and trust. This guide covers verification for both EVM and Solana deployments.
+
+## Why Verify Contracts?
+
+- **Transparency** - Users can audit contract logic before interacting
+- **Trust** - Verified code proves the deployed bytecode matches the source
+- **Debugging** - Verified contracts show decoded function calls and events
+- **Integration** - Tools like Etherscan can show function interfaces for verified contracts
+
+<Note>
+Verification is especially important for upgradeable contracts, as users need to inspect both proxy and implementation contracts.
+</Note>
+
+## EVM Contract Verification
+
+Across supports verification on Etherscan, block explorer APIs, and Sourcify.
+
+### Foundry Verification (Recommended)
+
+Foundry's built-in verification is the simplest method:
+
+```bash
+forge script script/DeployHubPool.s.sol:DeployHubPool \
+  --rpc-url ethereum \
+  --broadcast \
+  --verify \
+  -vvvv
+```
+
+The `--verify` flag automatically submits contract source code to Etherscan after deployment.
+
+#### Required Environment Variables
+
+Set API keys for block explorer verification:
+
+```bash
+export ETHERSCAN_API_KEY=YOUR_API_KEY
+```
+
+Foundry uses Etherscan-compatible APIs for most chains. The `foundry.toml` configures endpoints:
+
+```toml
+[etherscan]
+ethereum = { key = "${ETHERSCAN_API_KEY}" }
+```
+
+<Warning>
+Some chains require different API keys. Check the chain's block explorer documentation for API key registration.
+</Warning>
+
+### Manual Verification
+
+If automatic verification fails, verify manually:
+
+<Steps>
+  <Step title="Get contract address">
+    From deployment logs or `broadcast/deployed-addresses.json`:
+
+    ```bash
+    cat broadcast/deployed-addresses.json | jq '."1".HubPool'
+    ```
+  </Step>
+
+  <Step title="Generate standard JSON input">
+    Forge can generate the Solidity standard JSON input required by Etherscan:
+
+    ```bash
+    forge verify-contract \
+      --chain-id 1 \
+      --constructor-args $(cast abi-encode "constructor(address,address,address,address)" $LP_TOKEN_FACTORY $FINDER $WETH $TIMER) \
+      --compiler-version 0.8.30 \
+      $CONTRACT_ADDRESS \
+      contracts/HubPool.sol:HubPool
+    ```
+  </Step>
+
+  <Step title="Submit to Etherscan UI">
+    Alternatively, manually submit via Etherscan:
+    1. Go to the contract page on Etherscan
+    2. Click **Contract** tab → **Verify and Publish**
+    3. Select **Solidity (Standard JSON Input)**
+    4. Upload the JSON file from `out/HubPool.sol/HubPool.json`
+    5. Set compiler version to `0.8.30`
+    6. Click **Verify and Publish**
+  </Step>
+</Steps>
+
+### Hardhat Verification (Legacy)
+
+For Hardhat deployments, use the Etherscan plugin:
+
+```bash
+ETHERSCAN_API_KEY=XXX yarn hardhat etherscan-verify \
+  --network mainnet \
+  --license AGPL-3.0 \
+  --force-license \
+  --solc-input
+```
+
+Parameters:
+- `--license AGPL-3.0` - Specifies the license (contracts use BUSL-1.1 unless excepted)
+- `--force-license` - Forces license even if it differs from source code comments
+- `--solc-input` - Uses Solidity standard JSON input for verification
+
+<Note>
+Across contracts are licensed under BUSL-1.1. Individual exceptions may be made by Risk Labs. Contact licensing@risklabs.foundation for derivative work licensing.
+</Note>
+
+### Verifying Proxy Contracts
+
+UUPS proxies require verifying both proxy and implementation:
+
+<Steps>
+  <Step title="Verify implementation">
+    Verify the implementation contract first:
+
+    ```bash
+    forge verify-contract \
+      --chain-id 42161 \
+      $IMPLEMENTATION_ADDRESS \
+      contracts/Arbitrum_SpokePool.sol:Arbitrum_SpokePool
+    ```
+  </Step>
+
+  <Step title="Verify proxy">
+    Verify the ERC1967 proxy:
+
+    ```bash
+    forge verify-contract \
+      --chain-id 42161 \
+      $PROXY_ADDRESS \
+      lib/openzeppelin-contracts/contracts/proxy/ERC1967/ERC1967Proxy.sol:ERC1967Proxy
+    ```
+  </Step>
+
+  <Step title="Link on Etherscan">
+    Etherscan typically detects proxy patterns automatically. If not:
+    1. Go to proxy address on Etherscan
+    2. Click **Contract** → **More Options** → **Is this a proxy?**
+    3. Etherscan will detect the implementation and show a **Read as Proxy** tab
+  </Step>
+</Steps>
+
+## Sourcify Verification
+
+Sourceify provides decentralized verification:
+
+```bash
+forge verify-contract \
+  --verifier sourcify \
+  --verifier-url https://sourcify.dev/server \
+  $CONTRACT_ADDRESS \
+  contracts/HubPool.sol:HubPool
+```
+
+Sourceify verification is especially useful for:
+- Chains not supported by Etherscan
+- Additional decentralized verification
+- IPFS-pinned source code
+
+## Solana/SVM Program Verification
+
+Solana uses `solana-verify` for program verification with reproducible builds.
+
+### Prerequisites
+
+Install `solana-verify`:
+
+```bash
+cargo install solana-verify
+```
+
+### Environment Setup
+
+```bash
+export RPC_URL=https://api.mainnet-beta.solana.com
+export PROGRAM=svm_spoke
+export PROGRAM_ID=$(cat target/idl/$PROGRAM.json | jq -r ".address")
+export MULTISIG=<YOUR_SQUADS_VAULT>
+export SOLANA_VERSION=$(grep -A 2 'name = "solana-program"' Cargo.lock | grep 'version' | head -n 1 | cut -d'"' -f2)
+```
+
+### Verification Process
+
+<Steps>
+  <Step title="Verify locally">
+    First, verify that your local build matches the on-chain program:
+
+    ```bash
+    solana-verify verify-from-repo \
+      --url $RPC_URL \
+      --program-id $PROGRAM_ID \
+      --library-name $PROGRAM \
+      --base-image "solanafoundation/solana-verifiable-build:$SOLANA_VERSION" \
+      https://github.com/across-protocol/contracts
+    ```
+
+    This performs a Docker-based reproducible build and compares the hash to the deployed program.
+  </Step>
+
+  <Step title="Generate upload transaction">
+    After local verification succeeds, create a transaction to upload verification data on-chain:
+
+    ```bash
+    solana-verify export-pda-tx \
+      --url $RPC_URL \
+      --program-id $PROGRAM_ID \
+      --library-name $PROGRAM \
+      --base-image "solanafoundation/solana-verifiable-build:$SOLANA_VERSION" \
+      --uploader $MULTISIG \
+      https://github.com/across-protocol/contracts
+    ```
+
+    This generates a base58-encoded transaction.
+  </Step>
+
+  <Step title="Execute via Squads multisig">
+    Import the transaction into Squads:
+    1. Go to **Squads** → **Transactions** → **Import Transaction**
+    2. Paste the base58 transaction
+    3. All required signers approve
+    4. Execute the transaction
+
+    <Warning>
+    The multisig vault must have enough SOL for PDA creation. If the transaction fails, transfer SOL to the vault and retry.
+    </Warning>
+  </Step>
+
+  <Step title="Submit to OtterSec (mainnet only)">
+    For mainnet programs, submit to OtterSec's verification API:
+
+    ```bash
+    solana-verify remote submit-job \
+      --url $RPC_URL \
+      --program-id $PROGRAM_ID \
+      --uploader $MULTISIG
+    ```
+
+    This makes the verification data available via the OtterSec API for explorers and tools.
+  </Step>
+</Steps>
+
+### Verifying All Programs
+
+Repeat the process for each Across program:
+
+```bash
+# svm_spoke
+export PROGRAM=svm_spoke
+export PROGRAM_ID=$(cat target/idl/$PROGRAM.json | jq -r ".address")
+# ... run verification steps
+
+# multicall_handler
+export PROGRAM=multicall_handler
+export PROGRAM_ID=$(cat target/idl/$PROGRAM.json | jq -r ".address")
+# ... run verification steps
+
+# sponsored_cctp_src_periphery
+export PROGRAM=sponsored_cctp_src_periphery
+export PROGRAM_ID=$(cat target/idl/$PROGRAM.json | jq -r ".address")
+# ... run verification steps
+```
+
+## Verification Best Practices
+
+### For EVM Contracts
+
+- **Verify immediately after deployment** - Reduces the window where unverified contracts exist
+- **Use `--verify` flag** - Automatic verification during deployment is more reliable
+- **Verify on multiple explorers** - Use both Etherscan and Sourcify for redundancy
+- **Check constructor arguments** - Ensure constructor args are correctly encoded
+- **Verify both proxy and implementation** - Don't forget to verify implementation contracts
+- **Document verification** - Note verification status in deployment records
+
+### For Solana Programs
+
+- **Use verified builds** - Always deploy from `yarn build-svm-solana-verify` for production
+- **Verify before announcing** - Don't announce deployments until verification is complete
+- **Document build environment** - Note Solana version and build image in deployment docs
+- **Check PDA funding** - Ensure multisig has SOL before attempting on-chain upload
+- **Verify IDL too** - Ensure IDL matches the deployed program
+
+<Note>
+For Solana, reproducible builds are critical. Never deploy programs built locally without Docker verification.
+</Note>
+
+## Troubleshooting
+
+### Etherscan verification fails
+
+**Issue**: "Compilation error" or "Bytecode mismatch"
+
+**Solutions**:
+- Verify compiler version matches (0.8.30)
+- Check optimizer settings match `foundry.toml` (runs=800, via_ir=true)
+- Ensure constructor arguments are correctly encoded
+- Try manual verification with standard JSON input
+
+### Sourcify verification fails
+
+**Issue**: "Metadata hash mismatch"
+
+**Solutions**:
+- Ensure you're using `use_literal_content = true` in `foundry.toml`
+- Rebuild with `forge clean && forge build`
+- Check that all source files match exactly (no local modifications)
+
+### Solana verification fails locally
+
+**Issue**: "Hash mismatch" during `verify-from-repo`
+
+**Solutions**:
+- Ensure you built with `yarn build-svm-solana-verify` (Docker build)
+- Check Solana version matches: `$SOLANA_VERSION` must match deployed program's SDK version
+- Verify you're checking out the correct git commit/tag
+- Clear build cache: `rm -rf target/` and rebuild
+
+### Solana on-chain upload fails
+
+**Issue**: Transaction fails during `export-pda-tx` execution
+
+**Solutions**:
+- Check multisig vault SOL balance
+- Verify `--uploader` address is the vault, not the multisig itself
+- Ensure Squads has permission to spend from vault
+- Try with higher compute units if transaction times out
+
+## Verification Checklist
+
+Before marking deployment as complete:
+
+- [ ] **Implementation verified** on primary block explorer
+- [ ] **Proxy verified** (if applicable)
+- [ ] **Sourcify verification** submitted (EVM)
+- [ ] **Local verification** succeeded (Solana)
+- [ ] **On-chain verification PDA** created (Solana)
+- [ ] **OtterSec submission** completed (Solana mainnet)
+- [ ] **Verification links** documented in deployment records
+- [ ] **Multiple explorers** show verified status
+
+## Verification Resources
+
+### EVM Resources
+- [Foundry Verification Docs](https://book.getfoundry.sh/reference/forge/forge-verify-contract)
+- [Etherscan Verification API](https://docs.etherscan.io/tutorials/verifying-contracts-programmatically)
+- [Sourcify Documentation](https://docs.sourcify.dev/)
+
+### Solana Resources
+- [solana-verify GitHub](https://github.com/Ellipsis-Labs/solana-verifiable-build)
+- [Solana Reproducible Builds](https://solana.com/developers/guides/advanced/verified-builds)
+- [OtterSec Verification](https://docs.osec.io/audit-verification)
+
+## Next Steps
+
+- Return to [deployment guide](/guides/deployment) to deploy new contracts
+- Learn about [contract upgrades](/guides/upgrades) to update verified contracts
+- Explore [contract architecture](/concepts/architecture) to understand what you're verifying

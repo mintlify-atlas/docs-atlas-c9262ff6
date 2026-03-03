@@ -1,0 +1,176 @@
+---
+title: Chain Adapters Overview
+description: Learn how chain adapters enable cross-chain communication in Across Protocol
+---
+
+## Purpose
+
+Chain adapters are stateless contracts that enable the HubPool on Ethereum L1 to bridge tokens and relay messages to various L2 networks and sidechains. Each adapter wraps a chain's native bridge protocol, providing a unified interface for cross-chain operations.
+
+## Architecture
+
+### Delegatecall Pattern
+
+Adapters are called via `delegatecall` from the HubPool contract, executing the adapter's logic within the HubPool's context. This means:
+
+- Adapters access the HubPool's token balances and state
+- Events are emitted from the HubPool's address
+- Reentrancy protection is handled by the HubPool, not the adapters
+- Adapters must use `immutable` variables instead of storage
+
+```solidity
+// HubPool calls adapter via delegatecall
+function relaySpokePoolAdminFunction(uint256 chainId, bytes memory functionData) {
+    address adapter = crossChainContracts[chainId].adapter;
+    (bool success, ) = adapter.delegatecall(
+        abi.encodeCall(AdapterInterface.relayMessage, (spokePool, functionData))
+    );
+}
+```
+
+### Common Interface
+
+All adapters implement the `AdapterInterface` with two core functions:
+
+```solidity
+interface AdapterInterface {
+    /**
+     * @notice Send message to target on L2.
+     * @param target L2 address to send message to.
+     * @param message Message to send to target.
+     */
+    function relayMessage(address target, bytes calldata message) external payable;
+
+    /**
+     * @notice Send amount of l1Token to recipient on L2.
+     * @param l1Token L1 token to bridge.
+     * @param l2Token L2 token to receive.
+     * @param amount Amount of l1Token to bridge.
+     * @param to Bridge recipient.
+     */
+    function relayTokens(
+        address l1Token,
+        address l2Token,
+        uint256 amount,
+        address to
+    ) external payable;
+}
+```
+
+## Chain-Specific Bridge Wrapping
+
+Each adapter wraps the native bridge interface for its target chain:
+
+| Chain | Native Bridge | Adapter Implementation |
+|-------|---------------|------------------------|
+| Arbitrum | Inbox (Retryable Tickets) | `Arbitrum_Adapter` |
+| Optimism | CrossDomainMessenger | `Optimism_Adapter` |
+| OP Stack chains | CrossDomainMessenger | `OP_Adapter` |
+| Polygon | FxPortal + RootChainManager | `Polygon_Adapter` |
+| Solana | CCTP only | `Solana_Adapter` |
+
+### Multiple Bridge Support
+
+Adapters support multiple bridging mechanisms for different tokens:
+
+1. **Native bridge** - Chain-specific canonical bridge (default)
+2. **CCTP (Circle)** - For USDC bridging via Circle's protocol
+3. **LayerZero OFT** - For omnichain fungible tokens
+4. **Custom bridges** - Token-specific bridges (e.g., DAI on Optimism, SNX)
+
+Example from `Polygon_Adapter.relayTokens()`:
+
+```solidity
+function relayTokens(address l1Token, address l2Token, uint256 amount, address to) external payable {
+    address oftMessenger = _getOftMessenger(l1Token);
+
+    if (l1Token == address(L1_WETH)) {
+        // Use native bridge for WETH
+        L1_WETH.withdraw(amount);
+        ROOT_CHAIN_MANAGER.depositEtherFor{ value: amount }(to);
+    }
+    else if (_isCCTPEnabled() && l1Token == address(usdcToken)) {
+        // Use CCTP for USDC
+        _transferUsdc(to, amount);
+    }
+    else if (oftMessenger != address(0)) {
+        // Use LayerZero OFT if configured
+        _transferViaOFT(IERC20(l1Token), IOFT(oftMessenger), to, amount);
+    }
+    else if (l1Token == L1_MATIC) {
+        // Use Plasma bridge for MATIC
+        DEPOSIT_MANAGER.depositERC20ForUser(l1Token, to, amount);
+    }
+    else {
+        // Default: use PoS bridge
+        ROOT_CHAIN_MANAGER.depositFor(to, l1Token, abi.encode(amount));
+    }
+}
+```
+
+## Gas and Fee Handling
+
+Adapters require ETH to pay for L2 gas execution:
+
+```solidity
+// Arbitrum example: calculate required ETH
+function getL1CallValue(uint32 l2GasLimit) public pure returns (uint256) {
+    return L2_MAX_SUBMISSION_COST + L2_GAS_PRICE * l2GasLimit;
+}
+
+// HubPool must hold sufficient ETH balance
+function _contractHasSufficientEthBalance(uint32 l2GasLimit) internal view returns (uint256) {
+    uint256 requiredL1CallValue = getL1CallValue(l2GasLimit);
+    require(address(this).balance >= requiredL1CallValue, "Insufficient ETH balance");
+    return requiredL1CallValue;
+}
+```
+
+## Events
+
+Adapters emit standardized events:
+
+```solidity
+event MessageRelayed(address target, bytes message);
+event TokensRelayed(address l1Token, address l2Token, uint256 amount, address to);
+```
+
+Since adapters are called via delegatecall, these events are emitted from the HubPool's address.
+
+## Available Adapters
+
+- [Arbitrum Adapter](/contracts/adapters/arbitrum) - Nitro retryable tickets with address aliasing
+- [Optimism Adapter](/contracts/adapters/optimism) - Legacy OP Stack implementation
+- [OP Adapter](/contracts/adapters/optimism#op-adapter) - Modern OP Stack chains (Base, Mode, etc.)
+- [Polygon Adapter](/contracts/adapters/polygon) - FxPortal and Plasma bridges
+- [Solana Adapter](/contracts/adapters/solana) - CCTP-only cross-chain messaging to SVM
+
+## Implementation Notes
+
+### Security Considerations
+
+1. **No reentrancy guards** - Delegatecall context means HubPool handles reentrancy protection
+2. **Immutable state** - All adapter configuration must be immutable (constructor-set)
+3. **Token approvals** - Adapters approve bridge contracts, not the router
+4. **ETH handling** - Adapters check HubPool's ETH balance before bridging
+
+### Constructor Pattern
+
+Adapters receive all configuration in the constructor:
+
+```solidity
+constructor(
+    ArbitrumL1InboxLike _l1ArbitrumInbox,
+    ArbitrumL1ERC20GatewayLike _l1ERC20GatewayRouter,
+    address _l2RefundL2Address,
+    IERC20 _l1Usdc,
+    ITokenMessenger _cctpTokenMessenger,
+    address _adapterStore,
+    uint32 _oftDstEid,
+    uint256 _oftFeeCap
+)
+```
+
+## Source Code
+
+Adapter contracts are located in [`contracts/chain-adapters/`](https://github.com/across-protocol/contracts/tree/master/contracts/chain-adapters) in the Across Protocol repository.

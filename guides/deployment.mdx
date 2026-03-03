@@ -1,0 +1,297 @@
+---
+title: 'Deploying Contracts'
+description: 'Deploy Across Protocol contracts on EVM and Solana/SVM chains'
+---
+
+This guide covers deploying Across Protocol contracts on both EVM chains (using Hardhat or Foundry) and Solana/SVM chains (using Anchor).
+
+## Prerequisites
+
+Before deploying, ensure you have:
+
+- **Node.js** (minimum version 16.18.0, recommended 20.17)
+- **Foundry** - [Installation guide](https://book.getfoundry.sh/getting-started/installation)
+- **Anchor** (for Solana) - [Installation guide](https://www.anchor-lang.com/docs/installation)
+- **Environment variables** configured (RPC URLs, API keys, etc.)
+
+<Note>
+If you encounter build issues, try downgrading to Node 20.17 using `nvm use 20.17`. For Anchor users, run `avm use latest` if you've never used Anchor before.
+</Note>
+
+## EVM Deployment
+
+### Environment Setup
+
+Create environment variables for your deployment:
+
+```bash
+export NODE_URL_1=https://mainnet.infura.com/v3/YOUR_KEY
+export ETHERSCAN_API_KEY=YOUR_ETHERSCAN_KEY
+export MNEMONIC="your twelve word mnemonic phrase here"
+```
+
+The contracts use named RPC endpoints based on chain ID. See `foundry.toml` for the complete list:
+
+```toml
+[rpc_endpoints]
+arbitrum = "${NODE_URL_42161}"
+base = "${NODE_URL_8453}"
+ethereum = "${NODE_URL_1}"
+optimism = "${NODE_URL_10}"
+polygon = "${NODE_URL_137}"
+# ... see foundry.toml for full list
+```
+
+### Foundry Deployment (Recommended)
+
+<Steps>
+  <Step title="Build contracts">
+    Compile all contracts before deployment:
+
+    ```bash
+    forge build
+    ```
+  </Step>
+
+  <Step title="Deploy HubPool">
+    Deploy the HubPool contract on Ethereum mainnet:
+
+    ```bash
+    forge script script/DeployHubPool.s.sol:DeployHubPool \
+      --rpc-url ethereum \
+      --broadcast \
+      --verify \
+      -vvvv
+    ```
+
+    <Note>
+    First test deployment without `--broadcast` to simulate in dry-run mode.
+    </Note>
+  </Step>
+
+  <Step title="Deploy SpokePool">
+    Deploy a SpokePool on your target chain (e.g., Arbitrum):
+
+    ```bash
+    forge script script/DeployArbitrumSpokePool.s.sol:DeployArbitrumSpokePool \
+      --rpc-url arbitrum \
+      --broadcast \
+      --verify \
+      -vvvv
+    ```
+
+    Available SpokePool deployment scripts:
+    - `DeployArbitrumSpokePool.s.sol`
+    - `DeployOptimismSpokePool.s.sol`
+    - `DeployPolygonSpokePool.s.sol`
+    - `DeployZkSyncSpokePool.s.sol`
+    - `DeployUniversalSpokePool.s.sol`
+    - And more in `script/` directory
+  </Step>
+
+  <Step title="Extract deployed addresses">
+    After deployment, extract addresses to the deployment registry:
+
+    ```bash
+    yarn extract-addresses
+    ```
+
+    This updates `/broadcast/deployed-addresses.json` with your new deployments.
+  </Step>
+</Steps>
+
+### ZKSync Deployment
+
+ZKSync requires special configuration using the zksolc compiler:
+
+<Steps>
+  <Step title="Install foundry-zksync">
+    Install the ZKSync fork of Foundry:
+
+    See [instructions here](https://foundry-book.zksync.io/introduction/installation#using-foundryup-zksync).
+  </Step>
+
+  <Step title="Set ZKSync profile">
+    ```bash
+    export FOUNDRY_PROFILE=zksync
+    ```
+  </Step>
+
+  <Step title="Deploy contract">
+    ```bash
+    FOUNDRY_PROFILE=zksync forge script script/DeployZkSyncSpokePool.s.sol:DeployZkSyncSpokePool \
+      --rpc-url zksync \
+      --broadcast \
+      --verify \
+      -vvvv
+    ```
+
+    Or use the yarn shortcut:
+
+    ```bash
+    yarn forge-script-zksync script/DeployZkSyncSpokePool.s.sol:DeployZkSyncSpokePool \
+      --rpc-url zksync \
+      --broadcast \
+      --verify \
+      -vvvv
+    ```
+  </Step>
+</Steps>
+
+### Hardhat Deployment (Legacy)
+
+While Foundry is recommended, Hardhat is still supported:
+
+```bash
+NODE_URL_1=https://mainnet.infura.com/xxx \
+  yarn hardhat deploy --tags HubPool --network mainnet
+```
+
+## Solana/SVM Deployment
+
+Solana deployment uses Anchor and requires verified builds for production.
+
+### Initial Setup
+
+<Steps>
+  <Step title="Verify program IDs match keypairs">
+    Before deploying for the first time, ensure all program IDs in `lib.rs` and `Anchor.toml` match the deployment keypairs:
+
+    ```bash
+    anchor keys list
+    ```
+
+    Update IDs in your code to match keypairs under `target/deploy/` and commit changes.
+  </Step>
+
+  <Step title="Build verified binaries">
+    Use verified docker builds for production:
+
+    ```bash
+    unset IS_TEST  # Ensures production build
+    yarn build-svm-solana-verify  # Builds verified SVM binaries
+    yarn generate-svm-artifacts  # Builds IDLs
+    ```
+  </Step>
+
+  <Step title="Set environment variables">
+    Export required variables:
+
+    ```bash
+    export RPC_URL=https://api.devnet.solana.com
+    export KEYPAIR=~/.config/solana/dev-wallet.json
+    export PROGRAM=svm_spoke  # Also repeat for multicall_handler
+    export PROGRAM_ID=$(cat target/idl/$PROGRAM.json | jq -r ".address")
+    export MULTISIG=<YOUR_SQUADS_VAULT_ADDRESS>
+    export SOLANA_VERSION=$(grep -A 2 'name = "solana-program"' Cargo.lock | grep 'version' | head -n 1 | cut -d'"' -f2)
+    ```
+
+    For initial deployment, also set:
+
+    ```bash
+    export SVM_CHAIN_ID=$(cast to-dec $(cast shr $(cast shl $(cast keccak solana-devnet) 208) 208))
+    export HUB_POOL=0x14224e63716afAcE30C9a417E0542281869f7d9e  # Sepolia
+    export DEPOSIT_QUOTE_TIME_BUFFER=3600
+    export FILL_DEADLINE_BUFFER=21600
+    export MAX_LEN=$(( 2 * $(stat -c %s target/deploy/$PROGRAM.so) ))
+    ```
+  </Step>
+</Steps>
+
+### Deploy Program
+
+<Steps>
+  <Step title="Deploy the program">
+    ```bash
+    solana program deploy \
+      --url $RPC_URL \
+      --keypair $KEYPAIR \
+      --program-id target/deploy/$PROGRAM-keypair.json \
+      --max-len $MAX_LEN \
+      --with-compute-unit-price 100000 \
+      --max-sign-attempts 100 \
+      --use-rpc \
+      target/deploy/$PROGRAM.so
+    ```
+  </Step>
+
+  <Step title="Transfer upgrade authority to multisig">
+    ```bash
+    solana program set-upgrade-authority \
+      --url $RPC_URL \
+      --keypair $KEYPAIR \
+      --skip-new-upgrade-authority-signer-check \
+      $PROGRAM_ID \
+      --new-upgrade-authority $MULTISIG
+    ```
+  </Step>
+
+  <Step title="Upload IDL">
+    ```bash
+    anchor idl init \
+      --provider.cluster $RPC_URL \
+      --provider.wallet $KEYPAIR \
+      --filepath target/idl/$PROGRAM.json \
+      $PROGRAM_ID
+    ```
+  </Step>
+
+  <Step title="Set IDL authority to multisig">
+    ```bash
+    anchor idl set-authority \
+      --provider.cluster $RPC_URL \
+      --provider.wallet $KEYPAIR \
+      --program-id $PROGRAM_ID \
+      --new-authority $MULTISIG
+    ```
+  </Step>
+</Steps>
+
+### Initialize SVM Spoke
+
+For `svm_spoke`, initialize the program state:
+
+```bash
+anchor run initialize \
+  --provider.cluster $RPC_URL \
+  --provider.wallet $KEYPAIR -- \
+  --chainId $SVM_CHAIN_ID \
+  --remoteDomain 0 \
+  --crossDomainAdmin $HUB_POOL \
+  --svmAdmin $MULTISIG \
+  --depositQuoteTimeBuffer $DEPOSIT_QUOTE_TIME_BUFFER \
+  --fillDeadlineBuffer $FILL_DEADLINE_BUFFER
+```
+
+### Create Token Vault
+
+Create a vault for accepting deposits:
+
+```bash
+export MINT=4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU  # USDC on devnet
+anchor run createVault \
+  --provider.cluster $RPC_URL \
+  --provider.wallet $KEYPAIR -- \
+  --originToken $MINT
+```
+
+<Warning>
+Update the deployment info in `deployments/legacy-addresses.json` with the deployed program ID and deployment slot after deployment.
+</Warning>
+
+## Deployment Best Practices
+
+- **Always test in simulation mode first** - Run deployment scripts without `--broadcast` to verify parameters
+- **Verify contract addresses** - Double-check all referenced addresses (HubPool, WETH, bridges, etc.)
+- **Use verified builds for production** - Especially for Solana, always use verified docker builds
+- **Document deployments** - Update deployment registries immediately after deployment
+- **Set appropriate buffer values** - `QUOTE_TIME_BUFFER` and `FILL_DEADLINE_BUFFER` affect user experience
+- **Test upgrade authority** - Verify multisig control before announcing deployments
+
+## Next Steps
+
+After deployment:
+
+1. [Verify your contracts](/guides/verification) on block explorers
+2. Learn about [upgrading contracts](/guides/upgrades) using the UUPS pattern
+3. Review [contract architecture](/concepts/architecture) to understand the system

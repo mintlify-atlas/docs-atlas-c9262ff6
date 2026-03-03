@@ -1,0 +1,791 @@
+---
+title: "Protocol Roles"
+description: "Understanding the different participants in Across Protocol and their responsibilities"
+---
+
+## Overview
+
+Across Protocol involves five key roles, each with distinct responsibilities and economic incentives:
+
+<CardGroup cols={3}>
+  <Card title="Depositor" icon="user">
+    End users initiating cross-chain transfers
+  </Card>
+  <Card title="Relayer" icon="bolt">
+    Fill deposits by fronting capital for fees
+  </Card>
+  <Card title="Data Worker" icon="database">
+    Validate and aggregate cross-chain activity
+  </Card>
+  <Card title="Disputer" icon="gavel">
+    Monitor and challenge invalid proposals
+  </Card>
+  <Card title="Liquidity Provider" icon="coins">
+    Provide capital on L1 to earn fees
+  </Card>
+</CardGroup>
+
+## Depositor
+
+### Who Are They?
+
+Depositors are **end users** (typically non-technical) who want to transfer tokens from one chain to another. They can be:
+
+- Individual users bridging assets
+- Smart contracts initiating cross-chain operations
+- Protocols integrating Across for their users
+- Aggregators routing through Across
+
+### Responsibilities
+
+<AccordionGroup>
+  <Accordion title="Initiate Deposits">
+    Call `deposit()` or `depositV3()` on the origin chain's SpokePool to lock tokens and create a deposit order.
+  </Accordion>
+  
+  <Accordion title="Set Parameters">
+    Specify deposit parameters including recipient, output amount, fill deadline, and optional exclusivity settings.
+  </Accordion>
+  
+  <Accordion title="Pay Fees">
+    Pay relayer fees captured in the spread between `inputAmount` and `outputAmount`.
+  </Accordion>
+  
+  <Accordion title="Speed Up (Optional)">
+    Can call `speedUpDeposit()` to increase the fee and incentivize faster fills.
+  </Accordion>
+</AccordionGroup>
+
+### Entry Points
+
+<CodeGroup>
+```solidity Standard Deposit
+/**
+ * @notice Standard deposit with explicit parameters.
+ */
+function deposit(
+    bytes32 depositor,
+    bytes32 recipient,
+    bytes32 inputToken,
+    bytes32 outputToken,
+    uint256 inputAmount,
+    uint256 outputAmount,
+    uint256 destinationChainId,
+    bytes32 exclusiveRelayer,
+    uint32 quoteTimestamp,
+    uint32 fillDeadline,
+    uint32 exclusivityParameter,
+    bytes calldata message
+) public payable;
+```
+
+```solidity Deposit Now
+/**
+ * @notice Simplified deposit for users who don't know when transaction will mine.
+ * Sets quoteTimestamp to current time and fillDeadline as offset.
+ */
+function depositNow(
+    bytes32 depositor,
+    bytes32 recipient,
+    bytes32 inputToken,
+    bytes32 outputToken,
+    uint256 inputAmount,
+    uint256 outputAmount,
+    uint256 destinationChainId,
+    bytes32 exclusiveRelayer,
+    uint32 fillDeadlineOffset,
+    uint32 exclusivityParameter,
+    bytes calldata message
+) external payable;
+```
+
+```solidity Unsafe Deposit
+/**
+ * @notice Advanced deposit allowing custom nonce. Useful for pre-computing relay hashes.
+ * WARNING: Risk of deposit ID collision if nonce reused.
+ */
+function unsafeDeposit(
+    bytes32 depositor,
+    bytes32 recipient,
+    bytes32 inputToken,
+    bytes32 outputToken,
+    uint256 inputAmount,
+    uint256 outputAmount,
+    uint256 destinationChainId,
+    bytes32 exclusiveRelayer,
+    uint256 depositNonce,
+    uint32 quoteTimestamp,
+    uint32 fillDeadline,
+    uint32 exclusivityParameter,
+    bytes calldata message
+) public payable;
+```
+</CodeGroup>
+
+### Deposit Variants
+
+Across supports multiple deposit flows:
+
+- **Standard Deposits**: `deposit()` / `depositV3()`
+- **Gasless Deposits**: Off-chain signature, relayer submits
+- **Sponsored Deposits**: Third-party pays origin chain gas
+- **Cross-Chain Messages**: Include `message` for destination contract calls
+
+### Economic Incentives
+
+**Costs:**
+- Origin chain gas for `deposit()` call
+- Relayer fee (spread between input and output amounts)
+- LP fee (included in spread, collected by protocol)
+
+**Benefits:**
+- Fast cross-chain transfers (seconds vs. hours)
+- Guaranteed delivery (slow fill fallback)
+- Competitive pricing from relayer competition
+- No need to bridge assets manually
+
+## Relayer
+
+### Who Are They?
+
+Relayers are **sophisticated actors** who:
+
+- Run off-chain bots monitoring `FundsDeposited` events
+- Maintain inventory of tokens across multiple chains
+- Compete on speed and pricing
+- Front capital to fulfill deposits instantly
+
+### Responsibilities
+
+<Steps>
+  <Step title="Monitor Deposits">
+    Watch `FundsDeposited` events on all origin SpokePools.
+  </Step>
+  <Step title="Evaluate Profitability">
+    Calculate whether deposit fees cover costs (inventory, gas, opportunity cost).
+  </Step>
+  <Step title="Fill Deposits">
+    Call `fillRelay()` on destination SpokePool to send tokens to recipient.
+  </Step>
+  <Step title="Claim Refunds">
+    After bundle execution, call `executeRelayerRefundLeaf()` to claim repayment.
+  </Step>
+</Steps>
+
+### Fill Function
+
+<CodeGroup>
+```solidity Fill Relay
+/**
+ * @notice Fill a deposit by sending outputAmount to recipient.
+ * Relayer fronts capital and will be refunded via merkle proof.
+ */
+function fillRelay(
+    bytes32 depositor,
+    bytes32 recipient,
+    bytes32 inputToken,
+    bytes32 outputToken,
+    uint256 inputAmount,
+    uint256 outputAmount,
+    uint256 originChainId,
+    uint32 depositId,
+    uint32 fillDeadline,
+    uint32 exclusivityDeadline,
+    bytes calldata message
+) external nonReentrant unpausedFills;
+```
+
+```solidity Execute Refund
+/**
+ * @notice Claim relayer refund using merkle proof.
+ */
+function executeRelayerRefundLeaf(
+    uint32 rootBundleId,
+    RelayerRefundLeaf memory relayerRefundLeaf,
+    bytes32[] memory proof
+) public nonReentrant;
+```
+</CodeGroup>
+
+### Economic Model
+
+**Costs:**
+- Destination chain gas for `fillRelay()`
+- Opportunity cost of locked capital during challenge window (~2 hours)
+- Inventory management and rebalancing costs
+- Infrastructure costs (RPC nodes, bots, monitoring)
+
+**Revenue:**
+```
+Profit = inputAmount - outputAmount - gasCosts - lpFee
+```
+
+Where:
+- `inputAmount - outputAmount`: Gross fee paid by depositor
+- `gasCosts`: Destination chain gas for fill transaction
+- `lpFee`: Protocol fee charged on the refund
+
+**Example:**
+```
+Deposit: 1000 USDC input, 998 USDC output
+Gas cost: 0.5 USDC
+LP fee (0.1%): 1 USDC
+
+Profit = 1000 - 998 - 0.5 - 1 = 0.5 USDC
+```
+
+### Competitive Dynamics
+
+<CardGroup cols={2}>
+  <Card title="Speed Competition" icon="gauge-high">
+    Relayers compete on speed. Fastest relayer to fill earns the fee. This incentivizes low-latency infrastructure.
+  </Card>
+  <Card title="Inventory Management" icon="boxes-stacked">
+    Efficient inventory management across chains is crucial. Relayers need tokens on destination chains to fill.
+  </Card>
+  <Card title="Exclusive Arrangements" icon="handshake">
+    Depositors can designate exclusive relayers for negotiated pricing during exclusivity periods.
+  </Card>
+  <Card title="Market Making" icon="chart-line">
+    Similar to DEX market makers, relayers provide liquidity and compete on spreads.
+  </Card>
+</CardGroup>
+
+### Refund Chains
+
+Relayers can choose which chain to receive refunds on, allowing them to:
+- Optimize for gas costs
+- Rebalance inventory
+- Avoid chains with high withdrawal costs
+
+The data worker aggregates all refunds by relayer address and destination chain.
+
+## Data Worker
+
+### Who Are They?
+
+Data workers are **off-chain agents** operated by:
+
+- Risk Labs (protocol developer)
+- Potentially other sophisticated actors in the future
+
+Unlike relayers, data workers:
+- Don't need to be fast
+- Are RPC-intensive
+- Maintain longer lookback windows
+- Require significant infrastructure
+
+### Responsibilities
+
+<Steps>
+  <Step title="Monitor All Chains">
+    Index `FundsDeposited` and `FilledRelay` events from all SpokePools.
+  </Step>
+  <Step title="Validate Fills">
+    Verify that fills correctly match deposits based on relay hash.
+  </Step>
+  <Step title="Aggregate Activity">
+    Calculate net token flows for pool rebalancing and aggregate relayer refunds.
+  </Step>
+  <Step title="Construct Merkle Trees">
+    Build three merkle trees: pool rebalance, relayer refunds, and slow fills.
+  </Step>
+  <Step title="Propose Bundle">
+    Call `proposeRootBundle()` on HubPool, staking a bond.
+  </Step>
+  <Step title="Execute Bundle">
+    After challenge period, call `executeRootBundle()` to execute pool rebalance leaves.
+  </Step>
+</Steps>
+
+### Proposal Function
+
+<CodeGroup>
+```solidity Propose Root Bundle
+/**
+ * @notice Publish a new root bundle. Caller stakes a bond.
+ */
+function proposeRootBundle(
+    uint256[] calldata bundleEvaluationBlockNumbers,
+    uint8 poolRebalanceLeafCount,
+    bytes32 poolRebalanceRoot,
+    bytes32 relayerRefundRoot,
+    bytes32 slowRelayRoot
+) public override nonReentrant noActiveRequests unpaused {
+    require(poolRebalanceLeafCount > 0, "Bundle must have at least 1 leaf");
+
+    uint32 challengePeriodEndTimestamp = uint32(getCurrentTime()) + liveness;
+
+    delete rootBundleProposal;
+
+    rootBundleProposal.challengePeriodEndTimestamp = challengePeriodEndTimestamp;
+    rootBundleProposal.unclaimedPoolRebalanceLeafCount = poolRebalanceLeafCount;
+    rootBundleProposal.poolRebalanceRoot = poolRebalanceRoot;
+    rootBundleProposal.relayerRefundRoot = relayerRefundRoot;
+    rootBundleProposal.slowRelayRoot = slowRelayRoot;
+    rootBundleProposal.proposer = msg.sender;
+
+    bondToken.safeTransferFrom(msg.sender, address(this), bondAmount);
+
+    emit ProposeRootBundle(
+        challengePeriodEndTimestamp,
+        poolRebalanceLeafCount,
+        bundleEvaluationBlockNumbers,
+        poolRebalanceRoot,
+        relayerRefundRoot,
+        slowRelayRoot,
+        msg.sender
+    );
+}
+```
+</CodeGroup>
+
+### Economic Incentives
+
+**Costs:**
+- Bond amount (e.g., 10,000 USDC) staked per proposal
+- L1 gas for `proposeRootBundle()` and `executeRootBundle()` calls
+- Infrastructure costs (RPC nodes, databases, computation)
+- Risk of bond being slashed if proposal is invalid
+
+**Revenue:**
+- Protocol may compensate data workers directly
+- Or data workers may be protocol-aligned entities
+- Future: potential fee capture mechanism
+
+**Bond Mechanics:**
+```solidity
+bondAmount = baseBondAmount + finalFee
+
+// finalFee from UMA Store (e.g., 1500 USDC)
+// baseBondAmount set by admin (e.g., 8500 USDC)
+// Total: 10,000 USDC
+```
+
+Bond returned after all pool rebalance leaves executed.
+
+### Key Differences from Relayers
+
+<Tabs>
+  <Tab title="Speed">
+    **Relayers**: Compete on speed, milliseconds matter
+    
+    **Data Workers**: Speed not critical, proposals happen every few hours
+  </Tab>
+  <Tab title="Capital">
+    **Relayers**: Need large token inventory across chains
+    
+    **Data Workers**: Only need bond capital (no token inventory)
+  </Tab>
+  <Tab title="Infrastructure">
+    **Relayers**: Low-latency event monitoring
+    
+    **Data Workers**: Heavy RPC usage, large databases, long lookback windows
+  </Tab>
+  <Tab title="Risk">
+    **Relayers**: Risk of unprofitable fills, inventory losses
+    
+    **Data Workers**: Risk of bond being slashed for invalid proposals
+  </Tab>
+</Tabs>
+
+## Disputer
+
+### Who Are They?
+
+Disputers are actors who:
+
+- Monitor proposed root bundles
+- Validate bundle correctness off-chain
+- Challenge invalid bundles by calling `disputeRootBundle()`
+- Can be anyone, but typically:
+  - Protocol team
+  - Sophisticated third parties
+  - Automated monitoring bots
+
+### Responsibilities
+
+<Steps>
+  <Step title="Monitor Proposals">
+    Watch `ProposeRootBundle` events on HubPool.
+  </Step>
+  <Step title="Validate Bundle">
+    Reconstruct bundle off-chain and verify it matches the proposed roots.
+  </Step>
+  <Step title="Dispute if Invalid">
+    Call `disputeRootBundle()` if proposal is invalid, staking a bond.
+  </Step>
+  <Step title="UMA Oracle">
+    If disputed, UMA tokenholders vote on validity.
+  </Step>
+</Steps>
+
+### Dispute Function
+
+<CodeGroup>
+```solidity Dispute Root Bundle
+/**
+ * @notice Stake a bond to dispute the current root bundle.
+ * Proposal is deleted and dispute sent to optimistic oracle.
+ */
+function disputeRootBundle() public nonReentrant zeroOptimisticOracleApproval {
+    uint32 currentTime = uint32(getCurrentTime());
+    require(currentTime <= rootBundleProposal.challengePeriodEndTimestamp, 
+            "Request passed liveness");
+
+    uint256 finalFee = _getBondTokenFinalFee();
+
+    if (finalFee >= bondAmount) {
+        _cancelBundle();
+        return;
+    }
+
+    SkinnyOptimisticOracleInterface optimisticOracle = _getOptimisticOracle();
+
+    bondToken.safeIncreaseAllowance(address(optimisticOracle), bondAmount);
+    
+    try optimisticOracle.requestAndProposePriceFor(
+        identifier,
+        currentTime,
+        "",
+        bondToken,
+        0,
+        bondAmount - finalFee,
+        liveness,
+        rootBundleProposal.proposer,
+        int256(1e18)
+    ) returns (uint256) {
+        bondToken.safeApprove(address(optimisticOracle), 0);
+    } catch {
+        _cancelBundle();
+        return;
+    }
+
+    // Construct price request and dispute it
+    SkinnyOptimisticOracleInterface.Request memory ooPriceRequest = 
+        SkinnyOptimisticOracleInterface.Request({
+            proposer: rootBundleProposal.proposer,
+            disputer: address(0),
+            currency: bondToken,
+            settled: false,
+            proposedPrice: int256(1e18),
+            resolvedPrice: 0,
+            expirationTime: currentTime + liveness,
+            reward: 0,
+            finalFee: finalFee,
+            bond: bondAmount - finalFee,
+            customLiveness: liveness
+        });
+
+    delete rootBundleProposal;
+
+    bondToken.safeTransferFrom(msg.sender, address(this), bondAmount);
+    bondToken.safeIncreaseAllowance(address(optimisticOracle), bondAmount);
+    optimisticOracle.disputePriceFor(
+        identifier, 
+        currentTime, 
+        "", 
+        ooPriceRequest, 
+        msg.sender, 
+        address(this)
+    );
+
+    emit RootBundleDisputed(msg.sender, currentTime);
+}
+```
+</CodeGroup>
+
+### Economic Incentives
+
+**Costs:**
+- Bond amount staked to dispute (same as proposer bond)
+- L1 gas for `disputeRootBundle()` call
+- Infrastructure for monitoring and validation
+
+**Revenue (if correct):**
+```
+Reward = proposerBond + (proposerBond - finalFee) + disputerBond
+```
+
+**Loss (if incorrect):**
+```
+Loss = disputerBond (slashed and sent to proposer)
+```
+
+### UMA Oracle Resolution
+
+If a bundle is disputed:
+
+<Steps>
+  <Step title="Price Request">
+    Request sent to UMA's Optimistic Oracle asking "Is this bundle valid?"
+  </Step>
+  <Step title="Voting Period">
+    UMA tokenholders have 48-96 hours to vote.
+  </Step>
+  <Step title="Resolution">
+    - **Invalid**: Proposer bond slashed → disputer
+    - **Valid**: Disputer bond slashed → proposer
+  </Step>
+</Steps>
+
+### Game Theory
+
+The dispute mechanism creates strong incentives:
+
+- **Proposers**: Must be correct or lose bond
+- **Disputers**: Only dispute if confident (stake bond)
+- **UMA Voters**: Incentivized to vote correctly to maintain token value
+- **Result**: High economic security with minimal on-chain verification
+
+## Liquidity Provider (LP)
+
+### Who Are They?
+
+LPs are **passive capital providers** who:
+
+- Deposit L1 tokens into HubPool
+- Earn fees from relayer refunds
+- Provide liquidity to fund the protocol
+- Can be:
+  - Individual token holders
+  - Institutions
+  - DAOs
+  - Yield aggregators
+
+### Responsibilities
+
+<AccordionGroup>
+  <Accordion title="Provide Liquidity">
+    Call `addLiquidity()` on HubPool to deposit L1 tokens and receive LP tokens.
+  </Accordion>
+  
+  <Accordion title="Earn Fees">
+    LP tokens accrue value over time as fees are collected from relayer refunds.
+  </Accordion>
+  
+  <Accordion title="Withdraw Liquidity">
+    Call `removeLiquidity()` to burn LP tokens and redeem L1 tokens plus fees.
+  </Accordion>
+  
+  <Accordion title="Monitor Protocol">
+    Track utilization rates, APY, and protocol health.
+  </Accordion>
+</AccordionGroup>
+
+### Liquidity Functions
+
+<CodeGroup>
+```solidity Add Liquidity
+/**
+ * @notice Deposit liquidity to earn LP fees.
+ * Caller receives LP tokens representing their pool share.
+ */
+function addLiquidity(
+    address l1Token, 
+    uint256 l1TokenAmount
+) public payable override nonReentrant unpaused {
+    require(pooledTokens[l1Token].isEnabled, "Token not enabled");
+    require(((address(weth) == l1Token) && msg.value == l1TokenAmount) || msg.value == 0, 
+            "Bad msg.value");
+
+    uint256 lpTokensToMint = (l1TokenAmount * 1e18) / _exchangeRateCurrent(l1Token);
+    pooledTokens[l1Token].liquidReserves += l1TokenAmount;
+    ExpandedIERC20(pooledTokens[l1Token].lpToken).mint(msg.sender, lpTokensToMint);
+
+    if (address(weth) == l1Token && msg.value > 0) 
+        WETH9Interface(address(l1Token)).deposit{ value: msg.value }();
+    else 
+        IERC20(l1Token).safeTransferFrom(msg.sender, address(this), l1TokenAmount);
+
+    emit LiquidityAdded(l1Token, l1TokenAmount, lpTokensToMint, msg.sender);
+}
+```
+
+```solidity Remove Liquidity
+/**
+ * @notice Burns LP tokens to redeem for underlying l1Token.
+ */
+function removeLiquidity(
+    address l1Token,
+    uint256 lpTokenAmount,
+    bool sendEth
+) public override nonReentrant unpaused {
+    require(address(weth) == l1Token || !sendEth, "Cant send eth");
+    uint256 l1TokensToReturn = (lpTokenAmount * _exchangeRateCurrent(l1Token)) / 1e18;
+
+    ExpandedIERC20(pooledTokens[l1Token].lpToken).burnFrom(msg.sender, lpTokenAmount);
+    pooledTokens[l1Token].liquidReserves -= l1TokensToReturn;
+
+    if (sendEth) {
+        weth.withdraw(l1TokensToReturn);
+        Address.sendValue(payable(msg.sender), l1TokensToReturn);
+    } else {
+        IERC20(address(l1Token)).safeTransfer(msg.sender, l1TokensToReturn);
+    }
+    emit LiquidityRemoved(l1Token, l1TokensToReturn, lpTokenAmount, msg.sender);
+}
+```
+
+```solidity Exchange Rate
+/**
+ * @notice Returns exchange rate of L1 token to LP token.
+ * @return Amount of L1 tokens redeemable for 1 unit LP token.
+ */
+function exchangeRateCurrent(address l1Token) public override nonReentrant returns (uint256) {
+    return _exchangeRateCurrent(l1Token);
+}
+
+function _exchangeRateCurrent(address l1Token) internal returns (uint256) {
+    PooledToken storage pooledToken = pooledTokens[l1Token];
+    uint256 lpTokenTotalSupply = IERC20(pooledToken.lpToken).totalSupply();
+    if (lpTokenTotalSupply == 0) return 1e18; // initial rate is 1:1
+
+    _updateAccumulatedLpFees(pooledToken);
+    _sync(l1Token);
+
+    // ExchangeRate := (liquidReserves + utilizedReserves - undistributedLpFees) / lpTokenSupply
+    int256 numerator = int256(pooledToken.liquidReserves) +
+        pooledToken.utilizedReserves -
+        int256(pooledToken.undistributedLpFees);
+    return (uint256(numerator) * 1e18) / lpTokenTotalSupply;
+}
+```
+</CodeGroup>
+
+### Economic Model
+
+**Revenue Sources:**
+- **Relay Fees**: LPs earn a percentage of fees paid by depositors
+- **Continuous Accrual**: Fees accrue continuously via exponential decay
+
+**Fee Distribution:**
+```solidity
+lpFeeRatePerSecond = 0.0000015e18  // ~7.72 days to fully distribute fees
+
+// Fees accumulate over time
+accumulatedFees = undistributedLpFees * lpFeeRatePerSecond * timeElapsed
+
+// Exchange rate increases
+exchangeRate = (liquidReserves + utilizedReserves - undistributedLpFees) / lpTokenSupply
+```
+
+**Protocol Fee Capture:**
+```solidity
+protocolFee = totalFees * protocolFeeCapturePct
+lpFees = totalFees * (1 - protocolFeeCapturePct)
+```
+
+### Utilization and Risk
+
+<Tabs>
+  <Tab title="Liquid Reserves">
+    Tokens available in HubPool for immediate withdrawal.
+    
+    ```solidity
+    liquidReserves = totalDeposits - amountSentToSpokePools
+    ```
+  </Tab>
+  <Tab title="Utilized Reserves">
+    Tokens sent to SpokePools to fund relayer refunds.
+    
+    ```solidity
+    utilizedReserves = amountSentToSpokePools
+    ```
+    
+    Can be positive (sent to SpokePools) or negative (excess on SpokePools).
+  </Tab>
+  <Tab title="Utilization Rate">
+    ```solidity
+    utilizationRate = utilizedReserves / (liquidReserves + utilizedReserves)
+    ```
+    
+    Higher utilization = higher fees but less liquidity for withdrawals.
+  </Tab>
+</Tabs>
+
+### LP Risks
+
+<Warning>
+**Key Risks for LPs:**
+
+1. **Smart Contract Risk**: Bugs in HubPool or SpokePool contracts
+2. **Bridge Risk**: Tokens locked if a chain's canonical bridge fails
+3. **Admin Key Risk**: HubPool owner could theoretically haircut reserves
+4. **Utilization Risk**: High utilization may delay withdrawals
+5. **Token Risk**: Exposure to volatility of deposited tokens
+</Warning>
+
+**Mitigation:**
+- Extensive audits by OpenZeppelin ([audit reports](https://docs.across.to/resources/audits))
+- Optimistic verification with challenge periods
+- Gradual fee accrual reduces incentive for attacks
+- Multi-sig admin keys with timelock
+
+## Role Summary
+
+<CardGroup cols={1}>
+  <Card title="Depositor" icon="user">
+    **Type**: End user
+    
+    **Pays**: Relayer fees + gas
+    
+    **Receives**: Fast cross-chain transfers
+    
+    **Technical Level**: Low (simple SDK/UI)
+  </Card>
+  
+  <Card title="Relayer" icon="bolt">
+    **Type**: Sophisticated actor
+    
+    **Invests**: Token inventory + infrastructure
+    
+    **Earns**: Fee spread - gas - LP fees
+    
+    **Technical Level**: High (bot, RPC, inventory management)
+  </Card>
+  
+  <Card title="Data Worker" icon="database">
+    **Type**: Protocol-aligned operator
+    
+    **Invests**: Bond + heavy infrastructure
+    
+    **Earns**: Protocol compensation (or aligned incentives)
+    
+    **Technical Level**: Very high (RPC-intensive, long lookback)
+  </Card>
+  
+  <Card title="Disputer" icon="gavel">
+    **Type**: Watchdog
+    
+    **Invests**: Monitoring infrastructure + bond (only when disputing)
+    
+    **Earns**: Slashed proposer bonds (if correct)
+    
+    **Technical Level**: High (validation logic)
+  </Card>
+  
+  <Card title="Liquidity Provider" icon="coins">
+    **Type**: Passive capital provider
+    
+    **Invests**: L1 tokens
+    
+    **Earns**: Continuous fee accrual
+    
+    **Technical Level**: Low (simple deposit/withdraw)
+  </Card>
+</CardGroup>
+
+## Related Documentation
+
+<CardGroup cols={3}>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    System architecture overview
+  </Card>
+  <Card title="Hub-and-Spoke" icon="network-wired" href="/concepts/hub-and-spoke">
+    Hub-and-spoke model details
+  </Card>
+  <Card title="Protocol Flow" icon="arrows-turn-right" href="/concepts/protocol-flow">
+    Complete flow from deposit to refund
+  </Card>
+</CardGroup>

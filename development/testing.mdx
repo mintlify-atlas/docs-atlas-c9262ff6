@@ -1,0 +1,162 @@
+---
+title: Testing Overview
+description: Overview of testing strategy and commands for Across Protocol smart contracts
+---
+
+## Testing Strategy
+
+Across Protocol uses a multi-layered testing approach to ensure contract security and correctness:
+
+- **Foundry tests** (primary): Fast, gas-efficient unit and fork tests written in Solidity
+- **Hardhat tests** (legacy): TypeScript tests using Mocha/Chai, gradually being migrated to Foundry
+- **Fork tests**: Test against live network state to validate cross-chain interactions
+- **Gas analytics**: Monitor and optimize gas consumption for production deployments
+
+## Test Organization
+
+```
+test/evm/
+  foundry/           # Foundry tests (.t.sol)
+    local/           # Local unit tests
+    fork/            # Fork tests against live networks
+  hardhat/           # Legacy Hardhat tests (.ts)
+```
+
+## Quick Start
+
+### Run All Tests
+
+```bash
+# Run all EVM tests (Foundry + Hardhat)
+yarn test-evm
+
+# Run only Foundry tests (recommended)
+yarn test-evm-foundry
+
+# Run only Hardhat tests (legacy)
+yarn test-evm-hardhat
+```
+
+### Run Specific Tests
+
+```bash
+# Run specific test contract
+FOUNDRY_PROFILE=local-test forge test --match-contract HubPool_AdminTest
+
+# Run specific test function
+FOUNDRY_PROFILE=local-test forge test --match-test testDeposit
+
+# Run with verbose output
+FOUNDRY_PROFILE=local-test forge test -vvv
+
+# Run with gas reporting
+FOUNDRY_PROFILE=local-test forge test --gas-report
+```
+
+## Available Test Commands
+
+### EVM Tests
+
+| Command | Description |
+|---------|-------------|
+| `yarn test-evm` | Run all EVM tests (Foundry + Hardhat) |
+| `yarn test-evm-foundry` | Run Foundry local tests (uses FOUNDRY_PROFILE=local-test) |
+| `yarn test-evm-hardhat` | Run Hardhat tests (legacy) |
+| `FOUNDRY_PROFILE=local-test forge test` | Run Foundry tests directly |
+
+### SVM (Solana) Tests
+
+| Command | Description |
+|---------|-------------|
+| `yarn test-svm` | Run SVM tests with local toolchain build |
+| `yarn test-svm-solana-verify` | Run SVM tests with verified Docker build |
+
+### Combined Tests
+
+| Command | Description |
+|---------|-------------|
+| `yarn test` | Run all tests (EVM + SVM) with local builds |
+| `yarn test-verified` | Run all tests with verified builds |
+
+### Gas Reporting
+
+| Command | Description |
+|---------|-------------|
+| `yarn test:report-gas` | Run Hardhat tests with gas reporter enabled |
+| `FOUNDRY_PROFILE=local-test forge test --gas-report` | Run Foundry tests with gas reporting |
+
+## Test Environments
+
+### Local Tests
+
+Fast unit tests that don't require network connectivity. Use mocks for external contracts.
+
+```bash
+# Uses FOUNDRY_PROFILE=local-test
+yarn test-evm-foundry
+```
+
+### Fork Tests
+
+Tests that run against forked mainnet/testnet state. Useful for validating cross-chain behavior.
+
+```bash
+# Fork tests are in test/evm/foundry/fork/
+# Run with specific network RPC
+forge test --fork-url $NODE_URL_1 --match-path "test/evm/foundry/fork/**/*.sol"
+```
+
+## Test Configuration
+
+### Foundry Profiles
+
+The project uses Foundry profiles defined in `foundry.toml`:
+
+- **default**: Standard build configuration
+- **local-test**: Optimized for local unit tests (skips fork tests)
+- **zksync**: ZKSync-specific compilation
+
+<Warning>
+**Always use `FOUNDRY_PROFILE=local-test`** for local Foundry tests. Running `forge test` without this profile may include fork tests that require network access.
+</Warning>
+
+### Environment Variables
+
+For fork tests, set the appropriate RPC URLs:
+
+```bash
+export NODE_URL_1=https://mainnet.infura.com/v3/YOUR_KEY
+export NODE_URL_42161=https://arbitrum-mainnet.infura.com/v3/YOUR_KEY
+# ... see foundry.toml for all available endpoints
+```
+
+## Writing Tests
+
+See the framework-specific pages for detailed guidance:
+
+- [Foundry Tests](/development/foundry) - Primary testing framework
+- [Hardhat Tests](/development/hardhat) - Legacy tests (migration in progress)
+
+## Continuous Integration
+
+CI runs the following test suite:
+
+```bash
+# Build verification
+yarn build
+
+# Test execution
+yarn test-evm-foundry  # Local Foundry tests
+yarn test-evm-hardhat  # Legacy Hardhat tests
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Foundry Tests" icon="flask" href="/development/foundry">
+    Learn about writing and running Foundry tests
+  </Card>
+  <Card title="Hardhat Tests" icon="hammer" href="/development/hardhat">
+    Understand legacy Hardhat test structure
+  </Card>
+</CardGroup>

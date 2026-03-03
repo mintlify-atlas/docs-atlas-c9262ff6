@@ -1,0 +1,387 @@
+---
+title: "Polygon_SpokePool"
+description: "Polygon-specific SpokePool with FxPortal messaging and custom token bridging"
+---
+
+## Overview
+
+The `Polygon_SpokePool` is deployed on Polygon PoS (formerly Matic). It implements Polygon's unique FxPortal cross-chain messaging system and integrates with the custom `PolygonTokenBridger` contract due to special constraints in Polygon's native bridge.
+
+**Contract:** `contracts/Polygon_SpokePool.sol`
+
+## Key Characteristics
+
+- **FxPortal messaging**: Uses Polygon's FxChild contract for cross-chain admin verification
+- **Custom token bridger**: Uses `PolygonTokenBridger` instead of direct bridge calls
+- **Delegatecall validation**: Admin functions executed via delegatecall from `processMessageFromRoot()`
+- **CCTP support**: Integrates Circle CCTP for USDC transfers
+- **OFT support**: Supports LayerZero OFT tokens
+- **Native token wrapping**: Handles MATIC→WMATIC conversions
+- **EOA-only restrictions**: Enforces EOA callers for certain functions to prevent griefing
+
+## Inheritance
+
+```solidity
+contract Polygon_SpokePool is
+    IFxMessageProcessor,
+    SpokePool,
+    CircleCCTPAdapter
+```
+
+- Implements `IFxMessageProcessor` to receive FxPortal messages
+- Inherits base `SpokePool` functionality
+- Inherits `CircleCCTPAdapter` for USDC bridging
+
+## Constructor
+
+```solidity
+constructor(
+    address _wrappedNativeTokenAddress,
+    uint32 _depositQuoteTimeBuffer,
+    uint32 _fillDeadlineBuffer,
+    IERC20 _l2Usdc,
+    ITokenMessenger _cctpTokenMessenger,
+    uint32 _oftDstEid,
+    uint256 _oftFeeCap
+)
+    SpokePool(
+        _wrappedNativeTokenAddress,
+        _depositQuoteTimeBuffer,
+        _fillDeadlineBuffer,
+        _oftDstEid,
+        _oftFeeCap
+    )
+    CircleCCTPAdapter(
+        _l2Usdc,
+        _cctpTokenMessenger,
+        CircleDomainIds.Ethereum
+    )
+```
+
+**Parameters:**
+- `_wrappedNativeTokenAddress`: Address of WMATIC on Polygon
+- `_depositQuoteTimeBuffer`: Max age for deposit quote timestamps
+- `_fillDeadlineBuffer`: Max future offset for fill deadlines
+- `_l2Usdc`: Circle USDC address on Polygon (or 0x0 to disable CCTP)
+- `_cctpTokenMessenger`: Circle TokenMessenger contract for CCTP bridging
+- `_oftDstEid`: LayerZero endpoint ID for OFT messaging
+- `_oftFeeCap`: Maximum fee for OFT transfers
+
+## Initialization
+
+```solidity
+function initialize(
+    uint32 _initialDepositId,
+    PolygonTokenBridger _polygonTokenBridger,
+    address _crossDomainAdmin,
+    address _withdrawalRecipient,
+    address _fxChild
+) public initializer
+```
+
+**Parameters:**
+- `_initialDepositId`: Starting deposit nonce
+- `_polygonTokenBridger`: Address of PolygonTokenBridger contract
+- `_crossDomainAdmin`: L1 HubPool address
+- `_withdrawalRecipient`: Address receiving bridged tokens on L1 (typically HubPool)
+- `_fxChild`: Address of Polygon's FxChild contract
+
+**Implementation:**
+```solidity
+callValidated = false;
+__SpokePool_init(_initialDepositId, _crossDomainAdmin, _withdrawalRecipient);
+_setPolygonTokenBridger(payable(_polygonTokenBridger));
+_setFxChild(_fxChild);
+```
+
+## Admin Verification
+
+### `_requireAdminSender()`
+
+```solidity
+function _requireAdminSender() internal view override {
+    if (!callValidated) revert CallValidatedNotSet();
+}
+```
+
+**Polygon-specific pattern:** Admin verification requires that the function is called within the `processMessageFromRoot()` flow, validated by the `callValidated` flag.
+
+### FxPortal Message Processing
+
+```solidity
+function processMessageFromRoot(
+    uint256 /*stateId*/,
+    address rootMessageSender,
+    bytes calldata data
+) public validateInternalCalls {
+    // Validation logic
+    if (msg.sender != fxChild) revert NotFxChild();
+    if (rootMessageSender != crossDomainAdmin) revert NotHubPool();
+
+    // Delegatecall to execute admin function
+    (bool success, ) = address(this).delegatecall(data);
+    if (!success) revert DelegateCallFailed();
+
+    emit ReceivedMessageFromL1(msg.sender, rootMessageSender);
+}
+```
+
+**Flow:**
+1. HubPool on L1 sends message via FxPortal
+2. FxChild on Polygon calls `processMessageFromRoot()` on this contract
+3. Validates `msg.sender == fxChild` and `rootMessageSender == crossDomainAdmin`
+4. Uses delegatecall to execute the admin function on `this` contract
+5. The delegatecalled function checks `callValidated == true` in its `onlyAdmin` modifier
+
+### `validateInternalCalls` Modifier
+
+```solidity
+modifier validateInternalCalls() {
+    if (callValidated) revert CallValidatedAlreadySet();
+    
+    callValidated = true;  // Allow admin calls
+    _;
+    callValidated = false; // Reset after execution
+}
+```
+
+**Purpose:** Temporarily sets `callValidated` flag to allow admin functions to pass `_requireAdminSender()` check.
+
+## Token Bridging
+
+### `_bridgeTokensToHubPool()`
+
+```solidity
+function _bridgeTokensToHubPool(
+    uint256 amountToReturn,
+    address l2TokenAddress
+) internal override {
+    address oftMessenger = _getOftMessenger(l2TokenAddress);
+
+    // If the token is USDC, use CCTP bridge
+    if (_isCCTPEnabled() && l2TokenAddress == address(usdcToken)) {
+        _transferUsdc(withdrawalRecipient, amountToReturn);
+    }
+    // If token has OFT messenger, use LayerZero OFT
+    else if (oftMessenger != address(0)) {
+        _fundedTransferViaOft(
+            IERC20(l2TokenAddress),
+            IOFT(oftMessenger),
+            withdrawalRecipient,
+            amountToReturn
+        );
+    }
+    // Otherwise use PolygonTokenBridger
+    else {
+        PolygonIERC20Upgradeable(l2TokenAddress).safeIncreaseAllowance(
+            address(polygonTokenBridger),
+            amountToReturn
+        );
+        polygonTokenBridger.send(
+            PolygonIERC20Upgradeable(l2TokenAddress),
+            amountToReturn
+        );
+    }
+}
+```
+
+**Three bridging mechanisms:**
+
+1. **CCTP for USDC**: Uses Circle's Cross-Chain Transfer Protocol
+2. **LayerZero OFT**: For tokens with configured OFT messengers
+3. **PolygonTokenBridger**: Default mechanism for standard ERC20s
+
+### PolygonTokenBridger
+
+**Why needed:** Polygon's bridge has special constraints:
+- Complex token mapping system
+- Requires specific burn/lock patterns
+- Special handling for native MATIC vs WMATIC
+- The `PolygonTokenBridger` contract encapsulates this complexity
+
+**Warning in code:**
+```solidity
+// WARNING: Withdrawing MATIC can result in the L1 PolygonTokenBridger.startExitWithBurntTokens()
+// failing due to a MAX_LOGS constraint imposed by the ERC20Predicate, so if this SpokePool
+// will be used to withdraw MATIC then additional constraints need to be imposed to limit
+// the # of logs produced by the L2 withdrawal transaction.
+```
+
+## MATIC Handling
+
+### Native Token Wrapping
+
+```solidity
+function wrap() public nonReentrant {
+    _wrap();
+}
+
+function _wrap() internal {
+    uint256 balance = address(this).balance;
+    if (balance > 0) wrappedNativeToken.deposit{ value: balance }();
+}
+```
+
+**Why needed:** MATIC transfers from L1→L2 bridging don't trigger contract calls, so wrapping must be done explicitly.
+
+### `_preExecuteLeafHook()`
+
+```solidity
+function _preExecuteLeafHook(address l2TokenAddress) internal override {
+    // Wrap MATIC → WMATIC before distributing tokens.
+    // Only wrap if the token is not an OFT token
+    if (_getOftMessenger(l2TokenAddress) == address(0)) {
+        _wrap();
+    }
+}
+```
+
+Ensures any MATIC is wrapped to WMATIC before executing relayer refunds or slow fills.
+
+## Multicall Protection
+
+### `_validateMulticallData()`
+
+```solidity
+function _validateMulticallData(bytes[] calldata data) internal pure override {
+    bool hasOtherPublicFunctionCall = false;
+    bool hasExecutedLeafCall = false;
+    
+    for (uint256 i = 0; i < data.length; i++) {
+        bytes4 selector = bytes4(data[i][:4]);
+        
+        // Block nested multicalls
+        if (selector == MultiCallerUpgradeable.multicall.selector) {
+            revert MulticallExecuteLeaf();
+        }
+        // Block mixing executeRelayerRefundLeaf with other calls
+        else if (selector == SpokePoolInterface.executeRelayerRefundLeaf.selector) {
+            if (hasOtherPublicFunctionCall) revert MulticallExecuteLeaf();
+            hasExecutedLeafCall = true;
+        }
+        else {
+            if (hasExecutedLeafCall) revert MulticallExecuteLeaf();
+            hasOtherPublicFunctionCall = true;
+        }
+    }
+}
+```
+
+**Restrictions:**
+1. No nested multicalls
+2. Cannot mix `executeRelayerRefundLeaf()` with other function calls
+3. Can multicall multiple `executeRelayerRefundLeaf()` calls together
+4. Can multicall other public functions together (but not with execute functions)
+
+**Reason:** Prevents griefing attacks that could create oversized L2→L1 messages exceeding L1 calldata limits.
+
+## EOA Enforcement
+
+### `executeRelayerRefundLeaf()` Override
+
+```solidity
+function executeRelayerRefundLeaf(
+    uint32 rootBundleId,
+    SpokePoolInterface.RelayerRefundLeaf memory relayerRefundLeaf,
+    bytes32[] memory proof
+) public payable override {
+    // Check if caller is EOA (not contract or EIP7702 delegated wallet)
+    if (relayerRefundLeaf.amountToReturn > 0 &&
+        (msg.sender != tx.origin || msg.sender.code.length > 0))
+        revert NotEOA();
+    
+    super.executeRelayerRefundLeaf(rootBundleId, relayerRefundLeaf, proof);
+}
+```
+
+**Why needed:** Prevents contracts from batching `executeRelayerRefundLeaf()` with other calls that could produce excessive logs, which would cause the L2→L1 message to fail.
+
+**Checks:**
+- `msg.sender != tx.origin`: Rejects calls from contracts
+- `msg.sender.code.length > 0`: Rejects EIP-7702 delegated wallets
+
+## Admin Functions
+
+### `setFxChild()`
+
+```solidity
+function setFxChild(address newFxChild) public onlyAdmin nonReentrant {
+    _setFxChild(newFxChild);
+}
+
+function _setFxChild(address _fxChild) internal {
+    fxChild = _fxChild;
+    emit SetFxChild(_fxChild);
+}
+```
+
+### `setPolygonTokenBridger()`
+
+```solidity
+function setPolygonTokenBridger(
+    address payable newPolygonTokenBridger
+) public onlyAdmin nonReentrant {
+    _setPolygonTokenBridger(newPolygonTokenBridger);
+}
+
+function _setPolygonTokenBridger(address payable _polygonTokenBridger) internal {
+    polygonTokenBridger = PolygonTokenBridger(_polygonTokenBridger);
+    emit SetPolygonTokenBridger(address(_polygonTokenBridger));
+}
+```
+
+## State Variables
+
+```solidity
+// Address of FxChild which sends and receives messages to and from L1
+address public fxChild;
+
+// Contract that processes all cross-chain transfers between this contract and HubPool
+PolygonTokenBridger public polygonTokenBridger;
+
+// Internal variable that only flips temporarily to true upon receiving messages from L1
+bool private callValidated;
+```
+
+## Events
+
+```solidity
+event SetFxChild(address indexed newFxChild);
+event SetPolygonTokenBridger(address indexed polygonTokenBridger);
+event ReceivedMessageFromL1(address indexed caller, address indexed rootMessageSender);
+```
+
+## Errors
+
+```solidity
+error MulticallExecuteLeaf();
+error CallValidatedAlreadySet();
+error CallValidatedNotSet();
+error DelegateCallFailed();
+error NotHubPool();
+error NotFxChild();
+```
+
+## Unique Features
+
+1. **FxPortal integration**: Unique cross-chain messaging system specific to Polygon
+2. **Delegatecall pattern**: Admin functions executed via delegatecall for validation
+3. **PolygonTokenBridger**: Custom contract to handle Polygon bridge complexity
+4. **MATIC wrapping**: Explicit wrapping needed due to Polygon's bridging behavior
+5. **Griefing protection**: EOA enforcement and multicall restrictions to prevent L2→L1 message failures
+6. **Multi-bridge support**: CCTP, OFT, and native Polygon bridge
+
+## Architecture Notes
+
+- HubPool sends messages via FxPortal's StateSender on L1
+- FxChild contract on Polygon receives and forwards messages
+- Admin calls go through `processMessageFromRoot()` → delegatecall → actual function
+- The `callValidated` flag ensures functions are only callable via this flow
+- Token bridging is delegated to PolygonTokenBridger to handle Polygon-specific requirements
+- Special care taken to prevent excessive log production in L2→L1 messages
+
+## Related Contracts
+
+- [SpokePool](/contracts/spokepool) - Base contract
+- [Polygon Adapter](/contracts/adapters/polygon) - L1→L2 message relay via FxPortal from HubPool
+- PolygonTokenBridger - Token bridging helper (see source code)

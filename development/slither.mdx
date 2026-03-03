@@ -1,0 +1,261 @@
+---
+title: Slither Static Analysis
+description: Using Slither to detect vulnerabilities and analyze Solidity smart contracts
+---
+
+[Slither](https://github.com/crytic/slither) is a Solidity static analysis framework written in Python 3. It runs a suite of vulnerability detectors, prints visual information about contract details, and provides an API to easily write custom analyses.
+
+Slither enables developers to:
+- Find vulnerabilities before deployment
+- Enhance code comprehension
+- Quickly prototype custom analyses
+- Detect common security issues automatically
+
+## Installation
+
+Install Slither using pip:
+
+```bash
+pip3 install slither-analyzer
+```
+
+For other installation methods, see the [official documentation](https://github.com/crytic/slither#installation).
+
+## Running Slither
+
+The Across Protocol contracts have been analyzed using Slither v0.9.2 with no major bugs found.
+
+### Basic Usage
+
+```bash
+slither contracts/SpokePool.sol \
+  --solc-remaps @=node_modules/@ \
+  --solc-args "--optimize --optimize-runs 1000000" \
+  --filter-paths "node_modules" \
+  --exclude naming-convention
+```
+
+### Command Breakdown
+
+- `contracts/SpokePool.sol` - The contract file to analyze (replace with any contract)
+- `--solc-remaps @=node_modules/@` - Maps `@` imports to `node_modules/@`
+- `--solc-args "--optimize --optimize-runs 1000000"` - Passes optimization flags to solc (matches production settings)
+- `--filter-paths "node_modules"` - Excludes node_modules from analysis
+- `--exclude naming-convention` - Skips naming convention warnings (style-only issues)
+
+### Analyzing Other Contracts
+
+You can analyze any contract in the repository:
+
+```bash
+# Analyze HubPool
+slither contracts/HubPool.sol \
+  --solc-remaps @=node_modules/@ \
+  --solc-args "--optimize --optimize-runs 1000000" \
+  --filter-paths "node_modules" \
+  --exclude naming-convention
+
+# Analyze Arbitrum SpokePool
+slither contracts/Arbitrum_SpokePool.sol \
+  --solc-remaps @=node_modules/@ \
+  --solc-args "--optimize --optimize-runs 1000000" \
+  --filter-paths "node_modules" \
+  --exclude naming-convention
+
+# Analyze chain adapters
+slither contracts/chain-adapters/Arbitrum_Adapter.sol \
+  --solc-remaps @=node_modules/@ \
+  --solc-args "--optimize --optimize-runs 1000000" \
+  --filter-paths "node_modules" \
+  --exclude naming-convention
+```
+
+## Vulnerability Detection
+
+Slither includes over 70+ built-in detectors for common vulnerabilities and code issues:
+
+### High Severity Issues
+- Reentrancy vulnerabilities
+- Arbitrary `delegatecall` from user-supplied addresses
+- Unprotected upgrades
+- State variables shadowing
+- Incorrect ERC20 implementation
+
+### Medium Severity Issues
+- Locked Ether
+- Dangerous strict equalities
+- Block timestamp manipulation
+- Assembly usage
+- Low-level calls
+
+### Low Severity Issues
+- Unused return values
+- Conformance to Solidity naming conventions
+- Missing zero-address validation
+- Unused state variables
+
+### Informational
+- Public functions that could be external
+- Constant functions using assembly
+- Dead code
+- Pragma version
+
+## Common Options
+
+```bash
+# Show only high and medium severity issues
+slither contracts/SpokePool.sol --exclude-informational --exclude-low
+
+# Export results to JSON
+slither contracts/SpokePool.sol --json output.json
+
+# Generate a detailed report
+slither contracts/SpokePool.sol --print human-summary
+
+# Check for specific detectors
+slither contracts/SpokePool.sol --detect reentrancy-eth,unprotected-upgrade
+
+# Exclude specific detectors
+slither contracts/SpokePool.sol --exclude naming-convention,solc-version
+```
+
+## Understanding Output
+
+Slither categorizes findings by impact and confidence:
+
+**Impact Levels:**
+- **High**: Critical security issues that should be fixed immediately
+- **Medium**: Potential issues that require review
+- **Low**: Minor issues or optimizations
+- **Informational**: Code quality suggestions
+
+**Confidence Levels:**
+- **High**: Very likely to be an issue
+- **Medium**: Might be an issue, requires manual review
+- **Low**: Possibly a false positive
+
+### Example Output
+
+```
+SpokePool.sol analyzed (172 contracts with 82 detectors), 0 result(s) found
+```
+
+If issues are found, you'll see:
+
+```
+Impact: High
+Confidence: High
+Description: Reentrancy in SpokePool.fillRelay(...)
+  External calls:
+    - token.transfer(recipient, amount)
+  State variables written after the call:
+    - fills[relayHash] = true
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#reentrancy
+```
+
+## Integration with CI/CD
+
+Add Slither to your continuous integration pipeline:
+
+### GitHub Actions Example
+
+```yaml
+name: Slither Analysis
+
+on: [push, pull_request]
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run Slither
+        uses: crytic/slither-action@v0.3.0
+        with:
+          target: 'contracts/'
+          slither-args: '--solc-remaps @=node_modules/@ --filter-paths node_modules --exclude naming-convention'
+```
+
+## Advanced Usage
+
+### Generate Contract Summary
+
+```bash
+slither contracts/SpokePool.sol --print contract-summary
+```
+
+Shows:
+- Contract inheritance
+- Function visibility
+- State variables
+- Modifiers
+
+### Analyze Inheritance Graph
+
+```bash
+slither contracts/SpokePool.sol --print inheritance-graph
+```
+
+Generates a visual inheritance diagram.
+
+### Check for Upgradability Issues
+
+```bash
+slither contracts/SpokePool.sol \
+  --detect unprotected-upgrade,missing-inheritance,incorrect-inheritance
+```
+
+Especially important for UUPS upgradeable contracts like SpokePools.
+
+### Function Call Graph
+
+```bash
+slither contracts/SpokePool.sol --print call-graph
+```
+
+Visualizes function call relationships.
+
+## Best Practices
+
+1. **Run Slither regularly** - Include it in your development workflow
+2. **Fix high-severity issues first** - Prioritize by impact level
+3. **Review medium-severity findings** - Many require manual review and context
+4. **Don't ignore informational findings** - They improve code quality
+5. **Use the same compiler settings** - Match production optimization settings (1,000,000 runs)
+6. **Update Slither regularly** - New detectors are added frequently
+7. **Combine with other tools** - Use alongside Mythril, Echidna, or formal verification
+
+## Limitations
+
+- **False positives** - Static analysis can flag non-issues; manual review required
+- **Context-dependent** - Some patterns are safe in specific contexts but flagged anyway
+- **No runtime analysis** - Doesn't catch issues that only appear during execution
+- **EVM-only** - For Solana/SVM contracts, use different tools
+
+## Related Tools
+
+- **Mythril** - Symbolic execution and taint analysis
+- **Echidna** - Property-based fuzz testing
+- **Manticore** - Dynamic symbolic execution
+- **Securify** - Automated security analysis
+
+## Resources
+
+- [Slither GitHub Repository](https://github.com/crytic/slither)
+- [Detector Documentation](https://github.com/crytic/slither/wiki/Detector-Documentation)
+- [Trail of Bits Blog](https://blog.trailofbits.com/)
+- [Building Secure Contracts](https://github.com/crytic/building-secure-contracts)
+
+## Security Audits
+
+The Across Protocol contracts have been continuously audited by OpenZeppelin. All audit reports are available at:
+
+[https://docs.across.to/resources/audits](https://docs.across.to/resources/audits)
+
+Slither is a complementary tool to professional audits, not a replacement.
+
+## Related
+
+- [Scripts & Deployment](/development/scripts) - Build and deployment commands
+- [Testing Guide](/development/testing) - Running tests
+- [HubPool Contract](/contracts/hubpool) - Core L1 contract security patterns

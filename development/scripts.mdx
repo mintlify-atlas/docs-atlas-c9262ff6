@@ -1,0 +1,291 @@
+---
+title: Scripts & Deployment
+description: Overview of build scripts, deployment tools, and utility commands
+---
+
+The Across Protocol repository includes a comprehensive set of scripts for building, deploying, and managing smart contracts across EVM and SVM (Solana) environments.
+
+## Deployment Scripts
+
+Foundry deployment scripts are located in the `script/` directory. Each script follows a consistent pattern and can be run in simulation mode before deploying.
+
+### Available Deployment Scripts
+
+The repository contains deployment scripts for all major contracts:
+
+- **HubPool**: `DeployHubPool.s.sol` - Deploys the central L1 HubPool contract
+- **SpokePool Contracts**: Chain-specific deployment scripts
+  - `DeployArbitrumSpokePool.s.sol`
+  - `DeployOptimismSpokePool.s.sol`
+  - `DeployPolygonSpokePool.s.sol`
+  - `DeployZkSyncSpokePool.s.sol`
+  - `DeployLineSpokePool.s.sol`
+  - `DeployScrollSpokePool.s.sol`
+  - And many more...
+- **Adapters**: Chain adapter deployment scripts
+  - `DeployArbitrumAdapter.s.sol`
+  - `DeployOPAdapter.s.sol`
+  - `DeployPolygonAdapter.s.sol`
+  - `DeployUniversalAdapter.s.sol`
+- **Utilities**:
+  - `DeployMulticallHandler.s.sol`
+  - `DeployDonationBox.s.sol`
+  - `DeployAcrossEventEmitter.s.sol`
+
+### Running Deployment Scripts
+
+#### Basic Usage
+
+```bash
+# 1. Set up environment variables
+source .env  # Must contain MNEMONIC="..." and ETHERSCAN_API_KEY="..."
+
+# 2. Test in simulation mode
+forge script script/DeployHubPool.s.sol:DeployHubPool --rpc-url $NODE_URL_1 -vvvv
+
+# 3. Deploy and verify on-chain
+forge script script/DeployHubPool.s.sol:DeployHubPool --rpc-url $NODE_URL_1 --broadcast --verify -vvvv
+```
+
+#### Example: Deploy HubPool
+
+```bash
+forge script script/DeployHubPool.s.sol:DeployHubPool \
+  --rpc-url ethereum \
+  --broadcast \
+  --verify \
+  -vvvv
+```
+
+#### Example: Deploy Arbitrum SpokePool
+
+```bash
+forge script script/DeployArbitrumSpokePool.s.sol:DeployArbitrumSpokePool \
+  --rpc-url $NODE_URL_1 \
+  --broadcast \
+  --verify
+```
+
+### ZKSync Deployments
+
+ZKSync requires special handling due to its custom compiler. Set the `FOUNDRY_PROFILE` environment variable:
+
+```bash
+# Using foundry directly
+FOUNDRY_PROFILE=zksync forge script \
+  script/DeployZkSyncSpokePool.s.sol:DeployZkSyncSpokePool \
+  --rpc-url zksync \
+  --broadcast \
+  --verify \
+  -vvvv
+
+# Or use the yarn command
+yarn forge-script-zksync \
+  script/DeployZkSyncSpokePool.s.sol:DeployZkSyncSpokePool \
+  --rpc-url zksync \
+  --broadcast \
+  --verify \
+  -vvvv
+```
+
+## Build Scripts
+
+The repository supports building both EVM and SVM (Solana) contracts.
+
+### EVM Build Commands
+
+```bash
+# Build with Foundry
+forge build
+
+# Build with Hardhat
+yarn build-hardhat
+
+# Build Foundry specifically
+yarn build-evm-foundry
+
+# Compile ZKSync contracts (requires Docker)
+yarn compile-zksync
+```
+
+### SVM Build Commands
+
+The repository includes scripts for building Solana programs with both local toolchain and verified Docker builds.
+
+#### Local Toolchain Build
+
+```bash
+# Build SVM contracts using local Rust toolchain
+yarn build-svm
+
+# The script runs:
+# bash ./scripts/svm/buildHelpers/buildSvmLocalToolchain.sh
+```
+
+This script:
+- Detects if `IS_TEST=true` environment variable is set
+- Builds with `--features test` flag for test builds
+- Uses `anchor build` with appropriate cargo options
+
+#### Verified Docker Build
+
+```bash
+# Build SVM contracts using verified Solana docker image
+yarn build-svm-solana-verify
+
+# The script runs:
+# bash ./scripts/svm/buildHelpers/buildSolanaVerify.sh
+```
+
+This script:
+- Extracts Solana version from `Cargo.lock`
+- Builds each program using `solana-verify build`
+- Uses `solanafoundation/solana-verifiable-build` Docker image
+- Ensures reproducible builds for verification
+
+#### Generate SVM Artifacts
+
+```bash
+# Generate IDLs and TypeScript clients
+yarn generate-svm-artifacts
+
+# This runs:
+# - buildIdl.sh: Generates IDL files
+# - generateSvmAssets.sh: Creates asset files
+# - generateSvmClients.ts: Generates TypeScript clients
+# - renameClientsImports.ts: Fixes import paths
+```
+
+### Complete Build Commands
+
+```bash
+# Full build (local toolchain)
+yarn build
+# Equivalent to:
+# yarn build-hardhat && yarn build-svm && yarn generate-svm-artifacts && yarn build-ts
+
+# Full verified build (Docker)
+yarn build-verified
+# Equivalent to:
+# yarn build-hardhat && yarn build-svm-solana-verify && yarn generate-svm-artifacts && yarn build-ts
+```
+
+## Extract Addresses Command
+
+After deploying contracts with Foundry, extract deployed addresses to a consolidated file:
+
+```bash
+yarn extract-addresses
+
+# This runs:
+# ./script/utils/extract_foundry_addresses.sh
+```
+
+The script:
+- Reads from the `broadcast/` folder (Foundry deployment artifacts)
+- Extracts deployed contract addresses using TypeScript
+- Generates `/broadcast/deployed-addresses.json` with the latest deployed addresses
+- Useful for tracking deployments across multiple chains
+
+Legacy Hardhat deployment addresses are stored in `/deployments/legacy-addresses.json`.
+
+## Utility Scripts
+
+The `scripts/` directory contains additional utility scripts:
+
+### Contract Analysis
+
+```bash
+# Check EVM contract sizes
+yarn evm-contract-sizes
+# Runs: sh scripts/evm-contract-sizes.sh
+
+# Check storage layout before upgrades
+sh scripts/checkStorageLayout.sh
+
+# Diff storage layouts
+sh scripts/diffStorageLayout.sh
+```
+
+### Verification
+
+```bash
+# Verify bytecode matches source
+sh scripts/verifyBytecode.sh
+```
+
+### Setup Scripts
+
+```bash
+# Setup Arbitrum SpokePool post-deployment
+ts-node scripts/setupArbitrumSpokePool.ts
+
+# Setup Optimism SpokePool post-deployment
+ts-node scripts/setupOptimismSpokePool.ts
+```
+
+### Other Utilities
+
+```bash
+# Build sample merkle tree
+ts-node scripts/buildSampleTree.ts
+
+# Deploy multisig
+ts-node scripts/deployMultisig.ts
+
+# Finalize CCTP messages
+ts-node scripts/finalizeCCTPMessages.ts
+
+# Hyperliquid deposit handler
+ts-node scripts/hyperliquidDepositHandler.ts
+```
+
+## Pre-commit Hook
+
+The repository includes a pre-commit hook that runs automatically:
+
+```bash
+# Manually run pre-commit checks
+yarn pre-commit-hook
+# Runs: sh scripts/preCommitHook.sh
+```
+
+This hook:
+- Runs linting on staged files
+- Ensures code quality before commits
+- Configured via Husky in `package.json`
+
+## Environment Variables
+
+Deployment scripts require environment variables. Create a `.env` file:
+
+```bash
+# Deployer mnemonic (12 or 24 words)
+MNEMONIC="word1 word2 word3 ..."
+
+# Etherscan API key for verification
+ETHERSCAN_API_KEY="your-api-key"
+
+# RPC URLs
+NODE_URL_1=https://mainnet.infura.com/v3/your-key
+
+# For SVM deployments
+RPC_URL=https://api.devnet.solana.com
+KEYPAIR=~/.config/solana/dev-wallet.json
+PROGRAM=svm_spoke
+```
+
+## Best Practices
+
+1. **Always test in simulation mode first** - Run scripts without `--broadcast` to verify behavior
+2. **Use verbose output** - The `-vvvv` flag helps debug issues
+3. **Verify on-chain** - Always include `--verify` flag for production deployments
+4. **Extract addresses** - Run `yarn extract-addresses` after deployments to update the addresses file
+5. **Set correct profile** - Use `FOUNDRY_PROFILE=zksync` for ZKSync deployments
+6. **Environment setup** - Source your `.env` file before running deployment scripts
+
+## Related
+
+- [Slither Static Analysis](/development/slither) - Security analysis tool
+- [Testing Guide](/development/testing) - Running tests
+- [Deployment Guide](/guides/deployment) - Deploy contracts to networks

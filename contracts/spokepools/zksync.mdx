@@ -1,0 +1,379 @@
+---
+title: "ZkSync_SpokePool"
+description: "ZkSync Era-specific SpokePool with custom bridge integration and asset ID calculations"
+---
+
+## Overview
+
+The `ZkSync_SpokePool` is deployed on ZkSync Era. It implements ZkSync's unique bridging system with L2AssetRouter for ERC20 tokens, special ETH handling, and optional USDC bridges (either CCTP or Matter Labs' custom bridge).
+
+**Contract:** `contracts/ZkSync_SpokePool.sol`
+
+**Important:** This contract must be compiled with `@matterlabs/hardhat-zksync-solc`, not standard Solidity compiler.
+
+## Key Characteristics
+
+- **L2AssetRouter integration**: Uses ZkSync's asset router for token withdrawals
+- **Asset ID calculations**: Computes asset IDs from L1 token addresses and chain ID
+- **Dual USDC bridges**: Supports both CCTP and Matter Labs' custom USDC bridge
+- **ETH as ERC20**: Handles ZkSync's unique ETH implementation
+- **No EIP-7702 support**: ZkSync Era VM does not support EIP-7702 delegated wallets
+- **Address aliasing**: Uses same L1→L2 address transformation as Arbitrum
+- **Constructor parameters**: Uses constructor parameters instead of constants for gas optimization on zkEVM
+
+## Inheritance
+
+```solidity
+contract ZkSync_SpokePool is SpokePool, CircleCCTPAdapter
+```
+
+- Inherits base `SpokePool` functionality
+- Inherits `CircleCCTPAdapter` for optional CCTP bridging
+
+## Constructor
+
+```solidity
+constructor(
+    address _wrappedNativeTokenAddress,
+    IERC20 _circleUSDC,
+    ZkBridgeLike _zkUSDCBridge,
+    uint256 _l1ChainId,
+    ITokenMessenger _cctpTokenMessenger,
+    uint32 _depositQuoteTimeBuffer,
+    uint32 _fillDeadlineBuffer
+)
+    SpokePool(
+        _wrappedNativeTokenAddress,
+        _depositQuoteTimeBuffer,
+        _fillDeadlineBuffer,
+        0, // oftDstEid - ZkSync does not use OFT
+        0  // oftFeeCap - ZkSync does not use OFT
+    )
+    CircleCCTPAdapter(
+        _circleUSDC,
+        _cctpTokenMessenger,
+        CircleDomainIds.Ethereum
+    )
+```
+
+**Parameters:**
+- `_wrappedNativeTokenAddress`: Address of WETH on ZkSync Era
+- `_circleUSDC`: Circle USDC address (if using CCTP) or bridged USDC (if using zkUSDCBridge)
+- `_zkUSDCBridge`: Matter Labs' custom USDC bridge (or address(0) to use CCTP)
+- `_l1ChainId`: Chain ID of L1 (used in asset ID calculation)
+- `_cctpTokenMessenger`: Circle TokenMessenger for CCTP (or address(0) to use zkUSDCBridge)
+- `_depositQuoteTimeBuffer`: Max age for deposit quote timestamps
+- `_fillDeadlineBuffer`: Max future offset for fill deadlines
+
+**USDC Bridge Configuration:**
+```solidity
+if (address(_circleUSDC) != zero) {
+    bool zkUSDCBridgeDisabled = address(_zkUSDCBridge) == zero;
+    bool cctpUSDCBridgeDisabled = address(_cctpTokenMessenger) == zero;
+    // Bridged and Native USDC are mutually exclusive
+    if (zkUSDCBridgeDisabled == cctpUSDCBridgeDisabled) {
+        revert InvalidBridgeConfig();
+    }
+}
+```
+
+**Must choose exactly one USDC bridge:** Either zkUSDCBridge OR cctpTokenMessenger, not both or neither.
+
+## Initialization
+
+```solidity
+function initialize(
+    uint32 _initialDepositId,
+    address _crossDomainAdmin,
+    address _withdrawalRecipient
+) public initializer
+```
+
+**Parameters:**
+- `_initialDepositId`: Starting deposit nonce
+- `_crossDomainAdmin`: L1 HubPool address (will be aliased for verification)
+- `_withdrawalRecipient`: Address receiving bridged tokens on L1 (typically HubPool)
+
+**Implementation:**
+```solidity
+l2Eth = 0x000000000000000000000000000000000000800A;
+__SpokePool_init(_initialDepositId, _crossDomainAdmin, _withdrawalRecipient);
+```
+
+Sets `l2Eth` to ZkSync's system contract for ETH (`0x800A`).
+
+## Admin Verification
+
+### `_requireAdminSender()`
+
+```solidity
+function _requireAdminSender() internal override onlyFromCrossDomainAdmin {}
+```
+
+### `onlyFromCrossDomainAdmin` Modifier
+
+```solidity
+modifier onlyFromCrossDomainAdmin() {
+    require(
+        msg.sender == CrossDomainAddressUtils.applyL1ToL2Alias(crossDomainAdmin),
+        "ONLY_COUNTERPART_GATEWAY"
+    );
+    _;
+}
+```
+
+**ZkSync uses same aliasing as Arbitrum:**
+```solidity
+function applyL1ToL2Alias(address l1Address) internal pure returns (address l2Address) {
+    uint160 offset = uint160(0x1111000000000000000000000000000000001111);
+    l2Address = address(uint160(l1Address) + offset);
+}
+```
+
+When L1 contracts call L2 on ZkSync, `msg.sender` is the aliased address.
+
+## Token Bridging
+
+### `_bridgeTokensToHubPool()`
+
+```solidity
+function _bridgeTokensToHubPool(
+    uint256 amountToReturn,
+    address l2TokenAddress
+) internal override {
+    // Handle WETH: unwrap to ETH, then bridge ETH
+    if (l2TokenAddress == address(wrappedNativeToken)) {
+        WETH9Interface(l2TokenAddress).withdraw(amountToReturn);
+        IL2ETH(l2Eth).withdraw{value: amountToReturn}(withdrawalRecipient);
+    }
+    // Handle USDC: use CCTP or zkUSDCBridge
+    else if (l2TokenAddress == address(usdcToken)) {
+        if (_isCCTPEnabled()) {
+            _transferUsdc(withdrawalRecipient, amountToReturn);
+        } else {
+            IERC20(l2TokenAddress).forceApprove(address(zkUSDCBridge), amountToReturn);
+            zkUSDCBridge.withdraw(withdrawalRecipient, l2TokenAddress, amountToReturn);
+        }
+    }
+    // Handle other ERC20s: use L2AssetRouter
+    else {
+        bytes32 assetId = _getAssetId(l2TokenAddress);
+        bytes memory data = _encodeBridgeBurnData(
+            amountToReturn,
+            withdrawalRecipient,
+            l2TokenAddress
+        );
+        l2AssetRouter.withdraw(assetId, data);
+    }
+}
+```
+
+**Three bridging paths:**
+
+1. **ETH/WETH**: Unwrap to ETH, call `IL2ETH.withdraw()`
+2. **USDC**: Use CCTP or Matter Labs' zkUSDCBridge
+3. **Other ERC20s**: Use L2AssetRouter with computed asset ID
+
+## Asset ID Calculation
+
+### `_getAssetId()`
+
+```solidity
+function _getAssetId(address _l2TokenAddress) internal view returns (bytes32) {
+    address l1TokenAddress = l2AssetRouter.l1TokenAddress(_l2TokenAddress);
+    if (l1TokenAddress == address(0)) {
+        revert InvalidTokenAddress();
+    }
+    return keccak256(abi.encode(l1ChainId, L2_NATIVE_TOKEN_VAULT_ADDR, l1TokenAddress));
+}
+```
+
+**Formula from ZkSync contracts:**
+```solidity
+assetId = keccak256(abi.encode(
+    l1ChainId,                      // Chain ID of L1
+    L2_NATIVE_TOKEN_VAULT_ADDR,     // 0x10004 (system contract)
+    l1TokenAddress                   // L1 token address
+));
+```
+
+**Purpose:** ZkSync's asset router requires an asset ID to identify which L1 token to mint/unlock.
+
+**Requirements:**
+- Token must have been bridged from L1 via L2AssetRouter
+- Era-native tokens without L1 mapping will revert with `InvalidTokenAddress`
+
+### `_encodeBridgeBurnData()`
+
+```solidity
+function _encodeBridgeBurnData(
+    uint256 _amount,
+    address _remoteReceiver,
+    address _l2TokenAddress
+) internal pure returns (bytes memory) {
+    return abi.encode(_amount, _remoteReceiver, _l2TokenAddress);
+}
+```
+
+**Required format** for `l2AssetRouter.withdraw()` call.
+
+## ETH Handling
+
+### L2 ETH System Contract
+
+```solidity
+address public l2Eth; // 0x000000000000000000000000000000000000800A
+
+interface IL2ETH {
+    function withdraw(address _l1Receiver) external payable;
+}
+```
+
+**ZkSync-specific:** ETH on ZkSync implements a subset of ERC20 interface plus built-in bridging support.
+
+### `_preExecuteLeafHook()`
+
+```solidity
+function _preExecuteLeafHook(address l2TokenAddress) internal override {
+    if (l2TokenAddress == address(wrappedNativeToken))
+        _depositEthToWeth();
+}
+
+function _depositEthToWeth() internal {
+    if (address(this).balance > 0)
+        wrappedNativeToken.deposit{value: address(this).balance}();
+}
+```
+
+Wraps any ETH to WETH before executing relayer refunds or slow fills.
+
+## EIP-7702 Support
+
+### `_is7702DelegatedWallet()`
+
+```solidity
+function _is7702DelegatedWallet(address) internal pure override returns (bool) {
+    return false;
+}
+```
+
+**ZkSync does not support EIP-7702** delegated wallets, so this function always returns `false`.
+
+## ZkSync Bridge Interfaces
+
+### IL2AssetRouter
+
+```solidity
+interface IL2AssetRouter {
+    function withdraw(bytes32 _assetId, bytes memory _assetData) external returns (bytes32);
+    function l1TokenAddress(address _l2TokenAddress) external view returns (address);
+}
+```
+
+**System contract:** Deployed at `0x10003` (user contracts offset + 3)
+
+### ZkBridgeLike (Legacy USDC Bridge)
+
+```solidity
+interface ZkBridgeLike {
+    function withdraw(address _l1Receiver, address _l2Token, uint256 _amount) external;
+}
+```
+
+**Used for:** Bridged USDC on elastic chains before CCTP availability.
+
+### IL2ETH
+
+```solidity
+interface IL2ETH {
+    function withdraw(address _l1Receiver) external payable;
+}
+```
+
+**System contract:** Built-in ETH bridge at `0x800A`.
+
+## State Variables
+
+```solidity
+// ETH on ZkSync (system contract)
+address public l2Eth;
+
+// DEPRECATED: Old ERC20 bridge (replaced by l2AssetRouter)
+address public DEPRECATED_zkErc20Bridge;
+
+// Legacy USDC bridge (immutable)
+ZkBridgeLike public immutable zkUSDCBridge;
+
+// L1 chain ID for asset ID calculation (immutable)
+uint256 public immutable l1ChainId;
+```
+
+## Constants
+
+```solidity
+// Offset for ZkSync system contracts
+uint160 constant USER_CONTRACTS_OFFSET = 0x10000; // 2^16
+
+// L2 Asset Router address (system contract)
+address public constant L2_ASSET_ROUTER_ADDR = address(USER_CONTRACTS_OFFSET + 0x03);
+IL2AssetRouter public constant l2AssetRouter = IL2AssetRouter(L2_ASSET_ROUTER_ADDR);
+
+// L2 Native Token Vault address (system contract)
+address public constant L2_NATIVE_TOKEN_VAULT_ADDR = address(USER_CONTRACTS_OFFSET + 0x04);
+```
+
+**System contract addresses:**
+- `0x10003`: L2AssetRouter
+- `0x10004`: L2NativeTokenVault
+- `0x800A`: L2ETH
+
+## Events
+
+```solidity
+event SetZkBridge(address indexed erc20Bridge, address indexed oldErc20Bridge);
+```
+
+## Errors
+
+```solidity
+error InvalidBridgeConfig();
+error InvalidTokenAddress();
+```
+
+## Unique Features
+
+1. **Asset ID calculation**: Unique to ZkSync's bridge architecture
+2. **Dual USDC bridges**: Supports both CCTP and Matter Labs' custom bridge
+3. **ETH as system contract**: Special handling for ZkSync's ETH implementation
+4. **Constructor optimization**: Uses constructor params instead of constants for zkEVM gas savings
+5. **No EIP-7702**: Explicit override to disable delegated wallet detection
+6. **L1 chain ID parameter**: Needed for multi-chain ZkSync deployments (elastic chains)
+
+## Architecture Notes
+
+- ZkSync uses the same address aliasing mechanism as Arbitrum
+- Token bridging requires looking up L1 token address from L2AssetRouter
+- Asset IDs are computed from L1 chain ID + L2NativeTokenVault address + L1 token address
+- USDC can use either CCTP or Matter Labs' bridge, but not both
+- Contract must be compiled with ZkSync-specific compiler
+- System contracts are deployed at predefined addresses in the `0x10000+` range
+
+## Compilation Notes
+
+**From contract comments:**
+```solidity
+// On Ethereum, avoiding constructor parameters and putting them into constants reduces
+// gas cost upon contract deployment. On zkSync the opposite is true: deploying the same
+// bytecode for contracts, while changing only constructor parameters can lead to
+// substantial fee savings. So, the following params are all set by passing in constructor
+// params where possible.
+```
+
+**Resources:**
+- Compile with: `@matterlabs/hardhat-zksync-solc`
+- Docs: https://era.zksync.io/docs/tools/hardhat/hardhat-zksync-solc.html
+
+## Related Contracts
+
+- [SpokePool](/contracts/spokepool) - Base contract
+- ZkSync_Adapter - L1→L2 message relay from HubPool (see source code)

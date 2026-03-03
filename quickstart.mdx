@@ -1,80 +1,317 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get up and running with Across Protocol smart contracts
 ---
 
-## Get started in three steps
+This guide will help you build, test, and understand the Across Protocol smart contracts.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+Before you begin, ensure you have the following installed:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
+- **Node.js**: Version 22.18.0 or higher (version 20.17 recommended if you encounter build issues)
+- **Foundry**: Required for building and testing Solidity contracts
+- **Anchor**: Required if working with SVM (Solana) programs
+
+<Note>
+If you encounter build issues on initial `yarn` command, try downgrading to Node 20.17 using `nvm use 20.17`. If you've never used Anchor before, run `avm use latest`.
+</Note>
+
+## Installation
+
+Clone the repository and install dependencies:
+
+<CodeGroup>
+```bash npm
+npm install
+```
+
+```bash yarn
+yarn
+```
+
+```bash pnpm
+pnpm install
+```
+</CodeGroup>
+
+## Build the contracts
+
+The project supports building with both Foundry and Hardhat:
+
+<Steps>
+  <Step title="Build all contracts">
+    Compile Solidity and Rust code, generate TypeScript outputs:
     
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
+    <CodeGroup>
+    ```bash Local toolchain
+    yarn build
+    ```
     
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
+    ```bash Verified build
+    yarn build-verified
+    ```
+    </CodeGroup>
+  </Step>
+  
+  <Step title="Build EVM contracts only">
+    Use Foundry or Hardhat to compile Solidity contracts:
     
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    <CodeGroup>
+    ```bash Foundry
+    forge build
+    ```
+    
+    ```bash Hardhat
+    yarn build-hardhat
+    ```
+    </CodeGroup>
+  </Step>
+  
+  <Step title="Build SVM programs (optional)">
+    If working with Solana programs:
+    
+    ```bash
+    yarn build-svm
+    ```
+  </Step>
+</Steps>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+## Run tests
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+Across uses Foundry for new tests and Hardhat for legacy tests. The project is migrating to Foundry as the primary testing framework.
 
-### Step 3: Go live
+### Foundry tests (recommended)
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+Run all EVM tests with Foundry:
+
+```bash
+yarn test-evm-foundry
+```
+
+<Warning>
+Always use `FOUNDRY_PROFILE=local-test` when running Foundry tests in this repository. The `yarn test-evm-foundry` command sets this automatically.
+</Warning>
+
+### Run specific tests
+
+<CodeGroup>
+```bash Test by name
+FOUNDRY_PROFILE=local-test forge test --match-test testDeposit
+```
+
+```bash Test by contract
+FOUNDRY_PROFILE=local-test forge test --match-contract Router_Adapter
+```
+
+```bash Verbose output
+FOUNDRY_PROFILE=local-test forge test -vvv
+```
+</CodeGroup>
+
+### Hardhat tests (legacy)
+
+Run legacy Hardhat tests:
+
+```bash
+yarn test-evm-hardhat
+```
+
+### Gas analysis
+
+Run tests with gas reporting:
+
+<CodeGroup>
+```bash Foundry gas report
+yarn test:report-gas
+```
+
+```bash Gas analytics
+yarn test:gas-analytics
+```
+</CodeGroup>
+
+### SVM tests
+
+Test Solana programs:
+
+<CodeGroup>
+```bash Local toolchain
+yarn test-svm
+```
+
+```bash Verified build
+yarn test-svm-solana-verify
+```
+</CodeGroup>
+
+## Example: Deposit flow
+
+Here's how a user deposits tokens on a SpokePool:
+
+```solidity contracts/SpokePool.sol
+function depositV3(
+    address depositor,
+    address recipient,
+    address inputToken,
+    address outputToken,
+    uint256 inputAmount,
+    uint256 outputAmount,
+    uint256 destinationChainId,
+    address exclusiveRelayer,
+    uint32 quoteTimestamp,
+    uint32 fillDeadline,
+    uint32 exclusivityParameter,
+    bytes calldata message
+) public payable override {
+    deposit(
+        depositor.toBytes32(),
+        recipient.toBytes32(),
+        inputToken.toBytes32(),
+        outputToken.toBytes32(),
+        inputAmount,
+        outputAmount,
+        destinationChainId,
+        exclusiveRelayer.toBytes32(),
+        quoteTimestamp,
+        fillDeadline,
+        exclusivityParameter,
+        message
+    );
+}
+```
+
+### Key parameters
+
+- **depositor**: Account credited with the deposit who can speed up the transfer
+- **recipient**: Account receiving funds on the destination chain
+- **inputToken**: Token locked on origin chain (can be native token if wrapped)
+- **outputToken**: Token sent to recipient on destination chain
+- **inputAmount**: Amount deposited and locked
+- **outputAmount**: Amount relayer sends (fee = inputAmount - outputAmount)
+- **destinationChainId**: Target chain for the transfer
+- **quoteTimestamp**: HubPool timestamp used to determine system fees
+- **fillDeadline**: Deadline for relayers to fill the deposit
+
+## Example: Relayer fill
+
+Relayers fill deposits on the destination chain:
+
+```solidity contracts/SpokePool.sol
+// Relayers call fillRelay() or fillRelayWithUpdatedDeposit()
+// to fulfill user deposits on the destination chain.
+// The relayer fronts the output tokens and receives a refund
+// on their chosen repayment chain after the bundle is validated.
+```
+
+## Deploy contracts
+
+Across supports deployment via Foundry and Hardhat.
+
+### Deploy with Foundry
+
+```bash
+forge script script/001DeployHubPool.s.sol:DeployHubPool \
+  --rpc-url ethereum \
+  --broadcast \
+  --verify \
+  -vvvv
+```
+
+### Deploy with Hardhat
+
+```bash
+NODE_URL_1=https://mainnet.infura.com/xxx \
+  yarn hardhat deploy --tags HubPool --network mainnet
+```
+
+### Verify contracts
+
+Verify deployed contracts on Etherscan:
+
+```bash
+ETHERSCAN_API_KEY=XXX \
+  yarn hardhat etherscan-verify \
+  --network mainnet \
+  --license AGPL-3.0 \
+  --force-license \
+  --solc-input
+```
+
+## Lint and format
+
+Maintain code quality with linting:
+
+<CodeGroup>
+```bash Fix all issues
+yarn lint-fix
+```
+
+```bash Check only
+yarn lint
+```
+
+```bash Lint Solidity
+yarn lint-solidity
+```
+
+```bash Lint JavaScript
+yarn lint-js
+```
+
+```bash Lint Rust
+yarn lint-rust
+```
+</CodeGroup>
+
+## Project structure
+
+```
+contracts/           # Smart contract source files
+  chain-adapters/    # L1 chain adapters for bridging
+  interfaces/        # Interface definitions
+  libraries/         # Shared libraries
+test/evm/
+  foundry/           # Foundry tests (.t.sol)
+    local/           # Local unit tests
+    fork/            # Fork tests
+  hardhat/           # Legacy Hardhat tests (.ts)
+script/              # Foundry deployment scripts (.s.sol)
+  utils/             # Script utilities (Constants.sol)
+lib/                 # External dependencies (git submodules)
+```
+
+## Key contracts
+
+- **HubPool.sol** (`contracts/HubPool.sol`): Central L1 contract managing liquidity and root bundle validation
+- **SpokePool.sol** (`contracts/SpokePool.sol`): Base contract for all L2 spoke pools
+- **Arbitrum_SpokePool.sol**: Arbitrum-specific spoke pool with custom admin verification
+- **Optimism_SpokePool.sol**: Optimism-specific spoke pool (and OP Stack chains)
+- **Chain adapters** (`contracts/chain-adapters/`): Bridge tokens and messages to each L2
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Architecture guide" icon="sitemap" href="/architecture">
+    Learn about the hub-and-spoke model and protocol flow
+  </Card>
+  <Card title="HubPool contract" icon="circle-nodes" href="/contracts/hubpool">
+    Explore the central L1 contract managing liquidity
+  </Card>
+  <Card title="SpokePool contract" icon="circle-dot" href="/contracts/spokepool">
+    Understand how deposits and fills work on L2s
+  </Card>
+  <Card title="Testing guide" icon="flask" href="/testing">
+    Write tests for new features and adapters
+  </Card>
 </CardGroup>
 
+## Additional resources
+
+- [Audit reports](https://docs.across.to/resources/audits): Security audit reports by OpenZeppelin
+- [GitHub repository](https://github.com/across-protocol/contracts): Full source code
+- Deployed contracts: Check `broadcast/deployed-addresses.json` in the repository
+
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+For detailed deployment instructions for specific chains (including ZKSync and Solana), see the [README.md](https://github.com/across-protocol/contracts/blob/master/README.md) in the repository.
 </Note>

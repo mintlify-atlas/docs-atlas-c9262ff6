@@ -1,0 +1,150 @@
+---
+title: "AcrossConfigStore"
+description: "Configuration management for the Across Protocol"
+---
+
+## Overview
+
+The `AcrossConfigStore` contract serves as a centralized configuration management system for the Across Protocol. It provides a simple key-value store where protocol administrators can store and update configuration settings that are consumed by off-chain bots and agents.
+
+**Location**: `contracts/AcrossConfigStore.sol`
+
+## Purpose
+
+Unlike configuration contracts that validate parameters or enforce on-chain logic, AcrossConfigStore is specifically designed for off-chain consumption:
+
+- Stores token-specific configuration (e.g., rate models, transfer thresholds)
+- Maintains global protocol parameters (e.g., max leaf sizes for merkle trees)
+- Provides a transparent, on-chain source of truth for off-chain agents
+- Does not perform validation on stored values
+
+## Key Features
+
+### Two-Tier Configuration
+
+1. **Token-Specific Config**: Parameters associated with individual L1 tokens
+2. **Global Config**: Protocol-wide parameters accessible by all agents
+
+### Event Emission
+
+All configuration updates emit events, allowing off-chain agents to efficiently track changes without polling storage.
+
+## Contract Structure
+
+```solidity
+contract AcrossConfigStore is Ownable, MultiCaller {
+    // Token-specific configuration mapping
+    mapping(address => string) public l1TokenConfig;
+    
+    // Global configuration mapping (keyed by bytes32)
+    mapping(bytes32 => string) public globalConfig;
+    
+    event UpdatedTokenConfig(address indexed key, string value);
+    event UpdatedGlobalConfig(bytes32 indexed key, string value);
+}
+```
+
+## Core Functions
+
+### updateTokenConfig
+
+Updates configuration for a specific L1 token.
+
+```solidity
+function updateTokenConfig(
+    address l1Token,
+    string memory value
+) external onlyOwner
+```
+
+**Parameters**:
+- `l1Token`: The L1 token address to configure
+- `value`: JSON string containing token-specific parameters
+
+**Access**: Only callable by contract owner (governance)
+
+**Example Use Cases**:
+- Setting rate models for LP fee calculations
+- Configuring token transfer thresholds for pool rebalancing
+- Defining token-specific relay parameters
+
+### updateGlobalConfig
+
+Updates global protocol configuration.
+
+```solidity
+function updateGlobalConfig(
+    bytes32 key,
+    string calldata value
+) external onlyOwner
+```
+
+**Parameters**:
+- `key`: Unique identifier for the configuration parameter
+- `value`: JSON string containing the configuration value
+
+**Access**: Only callable by contract owner (governance)
+
+**Example Use Cases**:
+- `MAX_POOL_REBALANCE_LEAF_SIZE`: Maximum number of entries in pool rebalance merkle trees
+- `MAX_RELAYER_REPAYMENT_LEAF_SIZE`: Maximum number of entries in relayer refund merkle trees
+- Protocol-wide timing parameters and thresholds
+
+## Configuration Format
+
+Configuration values are stored as JSON-encoded strings, providing flexibility for complex parameter structures:
+
+```solidity
+// Example: Token config for USDC
+updateTokenConfig(
+    0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48, // USDC address
+    '{"rateModel": "0x...", "transferThreshold": "1000000000000"}'
+);
+
+// Example: Global config for max leaf size
+updateGlobalConfig(
+    keccak256("MAX_POOL_REBALANCE_LEAF_SIZE"),
+    '{"value": 25}'
+);
+```
+
+## Off-Chain Integration
+
+Off-chain agents (data workers, relayers) interact with AcrossConfigStore by:
+
+1. **Initial Load**: Reading current configuration on startup
+2. **Event Monitoring**: Listening for `UpdatedTokenConfig` and `UpdatedGlobalConfig` events
+3. **Parameter Parsing**: Decoding JSON strings into usable data structures
+4. **Periodic Refresh**: Optionally polling for missed updates
+
+## Governance Integration
+
+AcrossConfigStore is owned by the Across Protocol governance system. Configuration updates follow the standard governance proposal and execution flow:
+
+1. Proposal submitted to governance
+2. Token holders vote on changes
+3. Approved proposals execute `updateTokenConfig` or `updateGlobalConfig`
+4. Events emitted notify off-chain agents of changes
+
+## Security Considerations
+
+### No On-Chain Validation
+
+The contract intentionally does not validate configuration values. This design choice:
+- Provides maximum flexibility for off-chain parameter tuning
+- Reduces gas costs for updates
+- Places responsibility on governance to ensure correct values
+
+### Access Control
+
+All write functions are protected by `onlyOwner` modifier, ensuring only governance can modify configuration.
+
+### MultiCaller Support
+
+Inherits from MultiCaller, allowing batched configuration updates in a single transaction for gas efficiency.
+
+## Related Contracts
+
+- **HubPool**: Consumes configuration for bundle execution parameters
+- **SpokePool**: Off-chain agents use config to determine proper fill behavior
+- **Chain Adapters**: May reference config for bridge-specific parameters

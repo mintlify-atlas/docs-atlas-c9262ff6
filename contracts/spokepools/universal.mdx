@@ -1,0 +1,366 @@
+---
+title: "Universal_SpokePool"
+description: "Light-client based SpokePool using Helios for cross-chain verification"
+---
+
+## Overview
+
+The `Universal_SpokePool` is a novel SpokePool variant that uses storage proofs and the Helios L1 light client instead of canonical bridges for cross-chain admin verification. This enables deployment to any chain without requiring chain-specific bridge integrations.
+
+**Contract:** `contracts/Universal_SpokePool.sol`
+
+## Key Characteristics
+
+- **Light-client verification**: Uses Helios to verify L1 state instead of canonical bridges
+- **Storage proofs**: Validates calldata was stored by HubPool on L1
+- **HubPoolStore**: Dedicated L1 contract where HubPool stores execution data
+- **Replay protection**: Nonce-based to prevent message replay
+- **Emergency admin**: Multisig owner can execute if light client fails
+- **CCTP support**: Integrates Circle CCTP for USDC transfers
+- **OFT support**: Supports LayerZero OFT tokens
+- **Bridge-agnostic**: No canonical bridge integration required
+
+## Inheritance
+
+```solidity
+contract Universal_SpokePool is
+    OwnableUpgradeable,
+    SpokePool,
+    CircleCCTPAdapter
+```
+
+- Uses `OwnableUpgradeable` for emergency admin functions
+- Inherits base `SpokePool` functionality
+- Inherits `CircleCCTPAdapter` for USDC bridging
+
+## Constructor
+
+```solidity
+constructor(
+    uint256 _adminUpdateBufferSeconds,
+    address _helios,
+    address _hubPoolStore,
+    address _wrappedNativeTokenAddress,
+    uint32 _depositQuoteTimeBuffer,
+    uint32 _fillDeadlineBuffer,
+    IERC20 _l2Usdc,
+    ITokenMessenger _cctpTokenMessenger,
+    uint32 _oftDstEid,
+    uint256 _oftFeeCap
+)
+    SpokePool(
+        _wrappedNativeTokenAddress,
+        _depositQuoteTimeBuffer,
+        _fillDeadlineBuffer,
+        _oftDstEid,
+        _oftFeeCap
+    )
+    CircleCCTPAdapter(
+        _l2Usdc,
+        _cctpTokenMessenger,
+        CircleDomainIds.Ethereum
+    )
+```
+
+**Parameters:**
+- `_adminUpdateBufferSeconds`: Minimum time since last Helios update before owner can emergency execute (e.g., 24 hours)
+- `_helios`: Address of Helios L1 light client contract
+- `_hubPoolStore`: Address of L1 HubPoolStore contract
+- `_wrappedNativeTokenAddress`: Address of WETH on this chain
+- `_depositQuoteTimeBuffer`: Max age for deposit quote timestamps
+- `_fillDeadlineBuffer`: Max future offset for fill deadlines
+- `_l2Usdc`: Circle USDC address (or 0x0 to disable CCTP)
+- `_cctpTokenMessenger`: Circle TokenMessenger contract for CCTP bridging
+- `_oftDstEid`: LayerZero endpoint ID for OFT messaging
+- `_oftFeeCap`: Maximum fee for OFT transfers
+
+## Initialization
+
+```solidity
+function initialize(
+    uint32 _initialDepositId,
+    address _crossDomainAdmin,
+    address _withdrawalRecipient
+) public initializer
+```
+
+**Parameters:**
+- `_initialDepositId`: Starting deposit nonce
+- `_crossDomainAdmin`: L1 HubPool address (used for validation, not cross-chain messaging)
+- `_withdrawalRecipient`: Address receiving bridged tokens (typically an OFT or CCTP endpoint)
+
+## Architecture
+
+### Flow Overview
+
+1. **HubPool stores data on L1**:
+   ```solidity
+   // On L1 HubPoolStore
+   relayMessageCallData[nonce] = keccak256(abi.encode(target, calldata));
+   ```
+
+2. **Off-chain agent fetches data**:
+   - Sees `StoredCallData` event from HubPoolStore
+   - Waits for Helios to sync past that block
+   - Calls `executeMessage()` on Universal_SpokePool
+
+3. **SpokePool verifies and executes**:
+   - Checks storage proof via Helios
+   - Validates nonce hasn't been used
+   - Delegatecalls the provided calldata
+
+### Storage Proof Verification
+
+```solidity
+function executeMessage(
+    uint256 _messageNonce,
+    bytes calldata _message,
+    uint256 _blockNumber
+) external validateInternalCalls {
+    // Compute expected storage slot
+    bytes32 slotKey = getSlotKey(_messageNonce);
+    bytes32 expectedSlotValue = keccak256(_message);
+
+    // Verify via Helios light client
+    bytes32 slotValue = IHelios(helios).getStorageSlot(
+        _blockNumber,
+        hubPoolStore,
+        slotKey
+    );
+    if (expectedSlotValue != slotValue) {
+        revert SlotValueMismatch();
+    }
+
+    // Decode and validate target
+    (address target, bytes memory message) = abi.decode(_message, (address, bytes));
+    if (target != address(0) && target != address(this)) {
+        revert NotTarget();
+    }
+
+    // Replay protection
+    if (executedMessages[_messageNonce]) {
+        revert AlreadyExecuted();
+    }
+    executedMessages[_messageNonce] = true;
+    emit RelayedCallData(_messageNonce, msg.sender);
+
+    _executeCalldata(message);
+}
+```
+
+### Storage Slot Calculation
+
+```solidity
+function getSlotKey(uint256 _nonce) public pure returns (bytes32) {
+    return keccak256(abi.encode(_nonce, HUB_POOL_STORE_CALLDATA_MAPPING_SLOT_INDEX));
+}
+```
+
+**Formula:** `keccak256(key, slotIndex)` - standard Solidity mapping slot calculation
+
+**Constant:**
+```solidity
+uint256 public constant HUB_POOL_STORE_CALLDATA_MAPPING_SLOT_INDEX = 0;
+```
+
+## Admin Verification
+
+### `_requireAdminSender()`
+
+```solidity
+function _requireAdminSender() internal view override {
+    if (!_adminCallValidated) {
+        revert AdminCallNotValidated();
+    }
+}
+```
+
+**Pattern:** Similar to Polygon_SpokePool, uses a flag to ensure admin functions are only callable within validated flows.
+
+### `validateInternalCalls` Modifier
+
+```solidity
+modifier validateInternalCalls() {
+    if (_adminCallValidated) {
+        revert AdminCallAlreadySet();
+    }
+
+    _adminCallValidated = true;
+    _;
+    _adminCallValidated = false;
+}
+```
+
+**Purpose:** Temporarily enables admin calls during `executeMessage()` or `adminExecuteMessage()`.
+
+### Calldata Execution
+
+```solidity
+function _executeCalldata(bytes memory _calldata) internal {
+    (bool success, ) = address(this).delegatecall(_calldata);
+    if (!success) {
+        revert DelegateCallFailed();
+    }
+}
+```
+
+**Delegatecall:** Executes admin functions in context of this contract.
+
+## Emergency Admin
+
+### `adminExecuteMessage()`
+
+```solidity
+function adminExecuteMessage(
+    bytes memory _message
+) external onlyOwner validateInternalCalls {
+    uint256 heliosHeadTimestamp = IHelios(helios).headTimestamp();
+    
+    // Prevent execution if light client is being updated
+    if (heliosHeadTimestamp > block.timestamp ||
+        block.timestamp - heliosHeadTimestamp < ADMIN_UPDATE_BUFFER) {
+        revert AdminUpdateTooCloseToLastHeliosUpdate();
+    }
+    
+    _executeCalldata(_message);
+}
+```
+
+**Safety mechanism:**
+- Owner (multisig) can execute messages if Helios stops updating
+- Must wait `ADMIN_UPDATE_BUFFER` seconds since last Helios update
+- Prevents owner from bypassing light client in normal operation
+- Example buffer: 24 hours
+
+**Use case:** Light client contract failure, consensus failure, or other emergency scenarios.
+
+## Token Bridging
+
+### `_bridgeTokensToHubPool()`
+
+```solidity
+function _bridgeTokensToHubPool(
+    uint256 amountToReturn,
+    address l2TokenAddress
+) internal override {
+    address oftMessenger = _getOftMessenger(l2TokenAddress);
+
+    if (_isCCTPEnabled() && l2TokenAddress == address(usdcToken)) {
+        _transferUsdc(withdrawalRecipient, amountToReturn);
+    } else if (oftMessenger != address(0)) {
+        _fundedTransferViaOft(
+            IERC20(l2TokenAddress),
+            IOFT(oftMessenger),
+            withdrawalRecipient,
+            amountToReturn
+        );
+    } else {
+        revert NotImplemented();
+    }
+}
+```
+
+**Supported bridges:**
+1. **CCTP for USDC**: Circle's Cross-Chain Transfer Protocol
+2. **LayerZero OFT**: For tokens with configured OFT messengers
+3. **No canonical bridge**: Deliberately not implemented to remain chain-agnostic
+
+**Note:** Tokens must use CCTP or OFT to be bridged. Native bridges are intentionally unsupported.
+
+## State Variables
+
+```solidity
+// Immutable references to L1 contracts
+address public immutable hubPoolStore;
+address public immutable helios;
+
+// Emergency admin buffer
+uint256 public immutable ADMIN_UPDATE_BUFFER;
+
+// Replay protection
+mapping(uint256 => bool) public executedMessages;
+
+// Validation flag (private)
+bool private _adminCallValidated;
+```
+
+## Events
+
+```solidity
+event RelayedCallData(uint256 indexed nonce, address caller);
+```
+
+## Errors
+
+```solidity
+error NotTarget();
+error AdminCallAlreadySet();
+error SlotValueMismatch();
+error AdminCallNotValidated();
+error DelegateCallFailed();
+error AlreadyExecuted();
+error NotImplemented();
+error AdminUpdateTooCloseToLastHeliosUpdate();
+```
+
+## Helios Interface
+
+```solidity
+interface IHelios {
+    function getStorageSlot(
+        uint256 blockNumber,
+        address contractAddress,
+        bytes32 slot
+    ) external view returns (bytes32);
+    
+    function headTimestamp() external view returns (uint256);
+}
+```
+
+**Functions:**
+- `getStorageSlot()`: Fetches storage value with light client proof verification
+- `headTimestamp()`: Returns timestamp of latest verified L1 block
+
+## Unique Features
+
+1. **Light-client based**: First SpokePool to use storage proofs instead of canonical bridges
+2. **Chain-agnostic**: Can be deployed to any chain without custom bridge integration
+3. **Helios integration**: Uses Ethereum light client for L1 state verification
+4. **HubPoolStore**: Separate L1 contract stores execution data
+5. **Emergency admin**: Multisig fallback if light client fails
+6. **Bridge restrictions**: Only supports CCTP and OFT, not native bridges
+7. **Nonce-based replay protection**: Prevents message replay attacks
+
+## Architecture Notes
+
+- HubPool writes calldata hashes to HubPoolStore on L1
+- Off-chain agents monitor `StoredCallData` events
+- Agents wait for Helios to sync, then call `executeMessage()`
+- Contract verifies storage proof matches expected hash
+- Calldata is delegatecalled to execute admin function
+- Owner can emergency execute if Helios stops updating for >ADMIN_UPDATE_BUFFER
+- No canonical bridge means tokens must use CCTP or OFT
+- This design enables deployment to chains without Across-supported canonical bridges
+
+## Security Considerations
+
+1. **Light client assumptions**: Security depends on Helios light client correctness
+2. **Storage proof validity**: Helios must correctly verify Ethereum consensus
+3. **Replay protection**: Nonces must be unique and checked
+4. **Emergency admin risk**: Owner must be a trusted multisig with proper time locks
+5. **Target validation**: Prevents execution of calldata intended for other contracts
+6. **Delegatecall safety**: Calldata executed in context of this contract (requires careful HubPool validation)
+
+## Deployment Considerations
+
+- **ADMIN_UPDATE_BUFFER**: Set to high value (e.g., 24 hours) to prevent owner abuse
+- **Owner**: Must be reputable multisig (e.g., Across DAO multisig on this chain)
+- **Helios deployment**: Requires Helios light client deployed on target chain
+- **HubPoolStore**: Single shared contract on L1 for all Universal_SpokePools
+- **Token support**: Only tokens with CCTP or OFT support can be bridged
+
+## Related Contracts
+
+- [SpokePool](/contracts/spokepool) - Base contract
+- HubPoolStore - L1 contract that stores calldata for storage proof verification (see source code)
+- Helios - L1 light client contract for proof verification

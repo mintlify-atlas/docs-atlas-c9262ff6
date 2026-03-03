@@ -1,0 +1,266 @@
+---
+title: "Optimism_SpokePool"
+description: "Optimism-specific SpokePool with custom SNX bridge integration"
+---
+
+## Overview
+
+The `Optimism_SpokePool` is deployed on Optimism mainnet. It extends the `Ovm_SpokePool` base contract and adds custom bridging logic for Synthetix-related assets like SNX, which use a specialized bridge instead of the standard OP Stack bridge.
+
+**Contract:** `contracts/Optimism_SpokePool.sol`
+
+## Key Characteristics
+
+- **Extends Ovm_SpokePool**: Inherits OP Stack cross-domain messaging and standard bridge logic
+- **Custom SNX bridge**: Implements special handling for Synthetix Network Token (SNX)
+- **CCTP support**: Inherits Circle CCTP integration from Ovm_SpokePool
+- **Standard OP Stack patterns**: Uses CrossDomainMessenger for admin verification
+
+## Inheritance
+
+```solidity
+contract Optimism_SpokePool is Ovm_SpokePool
+```
+
+- Inherits `Ovm_SpokePool` which provides OP Stack bridging functionality
+- Inherits `CircleCCTPAdapter` through Ovm_SpokePool for USDC bridging
+
+## Constructor
+
+```solidity
+constructor(
+    address _wrappedNativeTokenAddress,
+    uint32 _depositQuoteTimeBuffer,
+    uint32 _fillDeadlineBuffer,
+    IERC20 _l2Usdc,
+    ITokenMessenger _cctpTokenMessenger
+)
+    Ovm_SpokePool(
+        _wrappedNativeTokenAddress,
+        _depositQuoteTimeBuffer,
+        _fillDeadlineBuffer,
+        _l2Usdc,
+        _cctpTokenMessenger
+    )
+```
+
+**Parameters:**
+- `_wrappedNativeTokenAddress`: Address of WETH on Optimism
+- `_depositQuoteTimeBuffer`: Max age for deposit quote timestamps
+- `_fillDeadlineBuffer`: Max future offset for fill deadlines
+- `_l2Usdc`: Circle USDC address on Optimism (or 0x0 to disable CCTP)
+- `_cctpTokenMessenger`: Circle TokenMessenger contract for CCTP bridging
+
+## Initialization
+
+```solidity
+function initialize(
+    uint32 _initialDepositId,
+    address _crossDomainAdmin,
+    address _withdrawalRecipient
+) public initializer
+```
+
+**Parameters:**
+- `_initialDepositId`: Starting deposit nonce
+- `_crossDomainAdmin`: L1 HubPool address
+- `_withdrawalRecipient`: Address receiving bridged tokens on L1 (typically HubPool)
+
+**Implementation:**
+```solidity
+__OvmSpokePool_init(
+    _initialDepositId,
+    _crossDomainAdmin,
+    _withdrawalRecipient,
+    Lib_PredeployAddresses.OVM_ETH
+);
+```
+
+Sets `l2Eth` to Optimism's predeploy ETH address (`0xDeadDeAddeAddEAddeadDEaDDEAdDeaDDeAD0000`).
+
+## Admin Verification
+
+### `_requireAdminSender()`
+
+Inherited from `Ovm_SpokePool`:
+
+```solidity
+function _requireAdminSender() internal view override {
+    if (LibOptimismUpgradeable.crossChainSender(MESSENGER) != crossDomainAdmin)
+        revert NotCrossDomainAdmin();
+}
+```
+
+**OP Stack verification:**
+- Checks that the cross-chain message sender (via L2CrossDomainMessenger) is the HubPool
+- Uses Optimism's `CrossDomainMessenger` contract at predeploy address
+- `MESSENGER` constant: `0x4200000000000000000000000000000000000007`
+
+## Token Bridging
+
+### `_bridgeTokensToHubPool()`
+
+```solidity
+function _bridgeTokensToHubPool(
+    uint256 amountToReturn,
+    address l2TokenAddress
+) internal virtual override {
+    // Handle custom SNX bridge which doesn't conform to the standard bridge interface
+    if (l2TokenAddress == SNX)
+        SynthetixBridgeToBase(SYNTHETIX_BRIDGE).withdrawTo(
+            withdrawalRecipient, // _to
+            amountToReturn       // _amount
+        );
+    else
+        super._bridgeTokensToHubPool(amountToReturn, l2TokenAddress);
+}
+```
+
+**Bridging logic:**
+
+1. **SNX tokens**: Use Synthetix's custom bridge
+   - Bridge address: `0x136b1EC699c62b0606854056f02dC7Bb80482d63`
+   - SNX address: `0x8700dAec35aF8Ff88c16BdF0418774CB3D7599B4`
+   - Calls `withdrawTo()` directly on SynthetixBridgeToBase
+
+2. **All other tokens**: Delegate to parent `Ovm_SpokePool._bridgeTokensToHubPool()`
+   - USDC via CCTP (if enabled)
+   - WETH unwrapped to ETH then bridged via L2StandardBridge
+   - Other ERC20s via L2StandardBridge or custom token bridges
+
+### Synthetix Bridge Interface
+
+```solidity
+interface SynthetixBridgeToBase {
+    function withdrawTo(address to, uint256 amount) external;
+}
+```
+
+**Why SNX needs custom handling:**
+- Synthetix uses a specialized bridge that predates the standard OP Stack bridge
+- The interface is non-standard (no L1 token parameter, different function signature)
+- SNX is a native L2 token on Optimism with different bridging requirements
+
+## Contract Constants
+
+```solidity
+// Address of custom bridge used to bridge Synthetix-related assets like SNX
+address private constant SYNTHETIX_BRIDGE = 0x136b1EC699c62b0606854056f02dC7Bb80482d63;
+
+// Address of SNX ERC20
+address private constant SNX = 0x8700dAec35aF8Ff88c16BdF0418774CB3D7599B4;
+```
+
+## Inherited Features from Ovm_SpokePool
+
+### Standard Bridge Integration
+
+For non-SNX tokens, inherits from Ovm_SpokePool:
+
+```solidity
+// Standard token bridge
+IL2ERC20Bridge(Lib_PredeployAddresses.L2_STANDARD_BRIDGE).withdrawTo(
+    l2TokenAddress,
+    withdrawalRecipient,
+    amountToReturn,
+    l1Gas,
+    ""
+);
+```
+
+### ETH/WETH Handling
+
+```solidity
+// ETH is unwrapped from WETH before bridging
+if (l2TokenAddress == address(wrappedNativeToken)) {
+    WETH9Interface(l2TokenAddress).withdraw(amountToReturn);
+    l2TokenAddress = l2Eth; // 0xDeadDeAddeAddEAddeadDEaDDEAdDeaDDeAD0000
+    IL2ERC20Bridge(Lib_PredeployAddresses.L2_STANDARD_BRIDGE).withdrawTo{value: amountToReturn}(
+        l2TokenAddress,
+        withdrawalRecipient,
+        amountToReturn,
+        l1Gas,
+        ""
+    );
+}
+```
+
+### CCTP USDC Bridging
+
+```solidity
+// If CCTP is enabled and token is USDC
+if (_isCCTPEnabled() && l2TokenAddress == address(usdcToken)) {
+    _transferUsdc(withdrawalRecipient, amountToReturn);
+}
+```
+
+### Custom Token Bridges
+
+For tokens with custom bridges (e.g., DAI):
+
+```solidity
+mapping(address => address) public tokenBridges;
+mapping(address => address) public remoteL1Tokens;
+
+// Set via admin functions
+function setTokenBridge(address l2Token, address tokenBridge) public onlyAdmin;
+function setRemoteL1Token(address l2Token, address l1Token) public onlyAdmin;
+```
+
+### Pre-Execute Hook
+
+```solidity
+function _preExecuteLeafHook(address l2TokenAddress) internal override {
+    if (l2TokenAddress == address(wrappedNativeToken))
+        _depositEthToWeth();
+}
+```
+
+Wraps any ETH to WETH before executing relayer refunds or slow fills.
+
+## Admin Functions (Inherited)
+
+### `setL1GasLimit()`
+
+```solidity
+function setL1GasLimit(uint32 newl1Gas) public onlyAdmin nonReentrant
+```
+
+Sets gas limit for L2→L1 messages.
+
+### `setTokenBridge()`
+
+```solidity
+function setTokenBridge(address l2Token, address tokenBridge) public onlyAdmin nonReentrant
+```
+
+Configures custom bridge for specific tokens.
+
+### `setRemoteL1Token()`
+
+```solidity
+function setRemoteL1Token(address l2Token, address l1Token) public onlyAdmin nonReentrant
+```
+
+Maps L2 native tokens to L1 addresses for `bridgeERC20To()` calls.
+
+## Unique Features
+
+1. **SNX-specific handling**: Only major override from base Ovm_SpokePool
+2. **Minimal additions**: Most functionality inherited from Ovm_SpokePool
+3. **Predeploy addresses**: Uses Optimism's standard predeploy contracts
+4. **Virtual override**: Allows further customization by child contracts (e.g., Base_SpokePool)
+
+## Architecture Notes
+
+- Optimism_SpokePool is a thin wrapper around Ovm_SpokePool
+- The only custom logic is SNX bridge integration
+- Uses OP Stack's CrossDomainMessenger for admin verification
+- Inherits multi-bridge support (CCTP, standard bridge, custom bridges)
+- The `virtual` keyword on `_bridgeTokensToHubPool()` allows chains like Base to further customize
+
+## Related Contracts
+
+- [SpokePool](/contracts/spokepool) - Base contract
+- [Optimism Adapter](/contracts/adapters/optimism) - L1→L2 message relay from HubPool
+- Ovm_SpokePool - Parent contract with OP Stack logic (see source code)

@@ -1,0 +1,645 @@
+---
+title: "SpokePool"
+description: "Cross-chain bridge contract deployed on each supported chain for deposits, fills, and relayer refunds"
+---
+
+## Overview
+
+SpokePool is the base contract deployed on every supported chain (L2s, sidechains, and L1) enabling users to deposit tokens for cross-chain transfers and relayers to fulfill those deposits. The contract locks deposited tokens, emits events for off-chain relayers, and executes merkle leaves to refund relayers and fulfill slow relays.
+
+**Contract Location:** `contracts/SpokePool.sol:35`
+
+<Info>
+SpokePool is an **abstract contract**. Each chain has a specific implementation (e.g., `Ethereum_SpokePool`, `Arbitrum_SpokePool`, `Optimism_SpokePool`) that overrides admin verification and bridge-specific logic.
+</Info>
+
+## Core Responsibilities
+
+- **Deposit Handling**: Accept user deposits with configurable fees, deadlines, and exclusivity periods
+- **Relay Fulfillment**: Allow relayers to fill deposits by sending tokens to recipients
+- **Merkle Root Execution**: Execute relayer refund and slow relay leaves from validated root bundles
+- **Cross-Chain Admin**: Receive and verify admin messages from HubPool on L1
+- **UUPS Upgradeable**: Upgradeable via UUPS proxy pattern with cross-chain admin control
+
+## Architecture
+
+### Inheritance
+
+```solidity
+abstract contract SpokePool is
+    V3SpokePoolInterface,
+    SpokePoolInterface,
+    UUPSUpgradeable,
+    ReentrancyGuardUpgradeable,
+    MultiCallerUpgradeable,
+    EIP712CrossChainUpgradeable,
+    IDestinationSettler,
+    OFTTransportAdapter
+```
+
+### Key Features
+
+- **UUPS Upgradeable**: Logic contract can be upgraded by cross-domain admin (HubPool)
+- **EIP-712 Signatures**: Supports signed deposit updates for speed-ups
+- **Multi-call**: Batch multiple calls in single transaction
+- **ERC-7683 Compatible**: Implements destination settler interface
+- **OFT Support**: Supports LayerZero OFT token bridging
+
+## Storage Variables
+
+<ParamField path="crossDomainAdmin" type="address">
+  Address of the L1 contract (HubPool) that acts as owner of this SpokePool. Unused when SpokePool is deployed on same chain as HubPool.
+</ParamField>
+
+<ParamField path="withdrawalRecipient" type="address">
+  Address that receives tokens withdrawn from this contract. Typically set to HubPool address for L2 SpokePools.
+</ParamField>
+
+<ParamField path="numberOfDeposits" type="uint32">
+  Counter for generating unique deposit IDs. Increments with each `deposit()` call. Note: name is legacy; `unsafeDeposit` bypasses this counter.
+</ParamField>
+
+<ParamField path="pausedFills" type="bool">
+  Whether fill-related functions are paused. When true, `fillRelay()` and related functions revert.
+</ParamField>
+
+<ParamField path="pausedDeposits" type="bool">
+  Whether deposit-related functions are paused. When true, `deposit()` and variants revert (except `speedUpDeposit`).
+</ParamField>
+
+<ParamField path="rootBundles" type="RootBundle[]">
+  Array of root bundles relayed from HubPool. Each contains relayer refund and slow relay merkle roots with claimed leaf bitmaps.
+  
+  **RootBundle struct:**
+  - `slowRelayRoot`: Merkle root for slow fill leaves
+  - `relayerRefundRoot`: Merkle root for relayer refund leaves
+  - `claimedBitmap`: 2D bitmap tracking claimed leaves (256x2^248 max)
+</ParamField>
+
+<ParamField path="fillStatuses" type="mapping(bytes32 => uint256)">
+  Maps relay hash to fill status enum: Unfilled (0), RequestedSlowFill (1), or Filled (2).
+</ParamField>
+
+<ParamField path="relayerRefund" type="mapping(address => mapping(address => uint256))">
+  Maps (L2 token address, relayer address) to outstanding refund amount. Used when refund transfer fails (e.g., blacklisted relayer).
+</ParamField>
+
+<ParamField path="oftMessengers" type="mapping(address => address)">
+  Maps L2 token address to OFT messenger address for LayerZero bridging.
+</ParamField>
+
+## Immutable Variables
+
+<ParamField path="wrappedNativeToken" type="WETH9Interface">
+  Address of wrapped native token (WETH, WMATIC, etc.). Enables depositing native tokens by wrapping.
+</ParamField>
+
+<ParamField path="depositQuoteTimeBuffer" type="uint32">
+  Maximum age for quote timestamps. Quote must be within `[currentTime - buffer, currentTime]`.
+</ParamField>
+
+<ParamField path="fillDeadlineBuffer" type="uint32">
+  Maximum fill deadline offset. Fill deadline must be ≤ `currentTime + buffer`.
+</ParamField>
+
+## Key Functions
+
+### depositV3
+
+Initiates a cross-chain token transfer. Locks input tokens and emits event for relayers to fill on destination chain.
+
+```solidity
+function depositV3(
+    address depositor,
+    address recipient,
+    address inputToken,
+    address outputToken,
+    uint256 inputAmount,
+    uint256 outputAmount,
+    uint256 destinationChainId,
+    address exclusiveRelayer,
+    uint32 quoteTimestamp,
+    uint32 fillDeadline,
+    uint32 exclusivityParameter,
+    bytes calldata message
+) public payable
+```
+
+<ParamField path="depositor" type="address">
+  Account credited with the deposit. Can later speed up the deposit by signing updated parameters.
+</ParamField>
+
+<ParamField path="recipient" type="address">
+  Account receiving funds on destination chain. Can be EOA or contract. If contract and message is non-empty, must implement `handleV3AcrossMessage()`.
+</ParamField>
+
+<ParamField path="inputToken" type="address">
+  Token locked in this contract. If wrappedNativeToken, can pass native token as `msg.value`.
+</ParamField>
+
+<ParamField path="outputToken" type="address">
+  Token relayer sends to recipient on destination chain. Must be non-zero.
+</ParamField>
+
+<ParamField path="inputAmount" type="uint256">
+  Amount of input token to lock. Sent to relayer as refund (minus system fee) after challenge period.
+</ParamField>
+
+<ParamField path="outputAmount" type="uint256">
+  Amount of output token relayer sends to recipient. Fee is `inputAmount - outputAmount` (adjusted for token decimals).
+</ParamField>
+
+<ParamField path="destinationChainId" type="uint256">
+  Chain ID where recipient receives tokens.
+</ParamField>
+
+<ParamField path="exclusiveRelayer" type="address">
+  Relayer with exclusive fill rights before exclusivity deadline. Must be non-zero if exclusivity deadline > current time.
+</ParamField>
+
+<ParamField path="quoteTimestamp" type="uint32">
+  HubPool timestamp used to determine system fee. Must be within `[currentTime - depositQuoteTimeBuffer, currentTime]`.
+</ParamField>
+
+<ParamField path="fillDeadline" type="uint32">
+  Deadline for filling on destination chain. Must be ≤ `currentTime + fillDeadlineBuffer`. Fills revert after this timestamp.
+</ParamField>
+
+<ParamField path="exclusivityParameter" type="uint32">
+  Determines exclusivity deadline via three modes:
+  1. **0**: No exclusivity (deadline = 0)
+  2. **≤ MAX_EXCLUSIVITY_PERIOD_SECONDS (31,536,000)**: Offset from block.timestamp (subject to reorg risk)
+  3. **> MAX_EXCLUSIVITY_PERIOD_SECONDS**: Absolute timestamp
+</ParamField>
+
+<ParamField path="message" type="bytes">
+  Data forwarded to recipient if contract. If non-empty, recipient must implement `handleV3AcrossMessage(address tokenSent, uint256 amount, bytes memory message)`.
+</ParamField>
+
+**Requirements:**
+- Deposits not paused
+- `outputToken != 0x0`
+- `quoteTimestamp` within buffer from current time
+- `fillDeadline ≤ currentTime + fillDeadlineBuffer`
+- If `msg.value > 0`, must equal `inputAmount` and `inputToken` must be `wrappedNativeToken`
+- If exclusivity deadline set, `exclusiveRelayer` must be non-zero
+
+**Emits:** `FundsDeposited(inputToken, outputToken, inputAmount, outputAmount, destinationChainId, depositId, quoteTimestamp, fillDeadline, exclusivityDeadline, depositor, recipient, exclusiveRelayer, message)`
+
+**Example:**
+```solidity
+// Deposit 1000 USDC on Optimism to receive 999 USDC on Arbitrum
+// 1 USDC fee, 1 hour fill deadline, no exclusivity
+spokePool.depositV3(
+    msg.sender,              // depositor
+    msg.sender,              // recipient
+    USDC_OPTIMISM,          // inputToken
+    USDC_ARBITRUM,          // outputToken
+    1000e6,                 // inputAmount
+    999e6,                  // outputAmount
+    42161,                  // destinationChainId (Arbitrum)
+    address(0),             // exclusiveRelayer (none)
+    uint32(block.timestamp), // quoteTimestamp
+    uint32(block.timestamp + 1 hours), // fillDeadline
+    0,                      // exclusivityParameter (no exclusivity)
+    ""                      // message
+);
+```
+
+---
+
+### fillRelay
+
+Fulfills a deposit by sending output tokens to the recipient. Relayer fronts capital and is refunded later via merkle proof.
+
+```solidity
+function fillRelay(
+    V3RelayData memory relayData,
+    uint256 repaymentChainId,
+    bytes32 repaymentAddress
+) public nonReentrant unpausedFills
+```
+
+<ParamField path="relayData" type="V3RelayData">
+  Struct containing all deposit parameters. Must exactly match the `FundsDeposited` event from origin chain.
+  
+  **V3RelayData fields:**
+  - `depositor`: Original depositor (bytes32)
+  - `recipient`: Token recipient (bytes32)
+  - `exclusiveRelayer`: Address with exclusive fill rights (bytes32)
+  - `inputToken`: Token deposited on origin (bytes32)
+  - `outputToken`: Token to send on destination (bytes32)
+  - `inputAmount`: Amount deposited
+  - `outputAmount`: Amount to send to recipient
+  - `originChainId`: Origin chain ID
+  - `depositId`: Unique deposit identifier
+  - `fillDeadline`: Latest fill timestamp
+  - `exclusivityDeadline`: Exclusive relayer deadline
+  - `message`: Data to forward to recipient
+</ParamField>
+
+<ParamField path="repaymentChainId" type="uint256">
+  Chain where relayer wants refund. Can be any supported chain, not just origin.
+</ParamField>
+
+<ParamField path="repaymentAddress" type="bytes32">
+  Address to receive refund on repayment chain.
+</ParamField>
+
+**Requirements:**
+- Fills not paused
+- Current time ≤ fill deadline
+- If before exclusivity deadline, caller must be exclusive relayer
+- Relay not already filled or slow-fill requested
+- This chain's ID matches `relayData.destinationChainId`
+- Relayer has sufficient token balance
+
+**Effects:**
+- Transfers `outputAmount` of `outputToken` to recipient
+- If recipient is contract and message non-empty, calls `handleV3AcrossMessage()`
+- Unwraps WETH to ETH for EOA recipients if output token is wrapped native
+- Marks relay as filled
+- If refund transfer fails, credits `relayerRefund` mapping
+
+**Emits:** `FilledRelay(inputToken, outputToken, inputAmount, outputAmount, repaymentChainId, originChainId, depositId, fillDeadline, exclusivityDeadline, exclusiveRelayer, relayer, depositor, recipient, messageHash, relayExecutionInfo)`
+
+---
+
+### executeRelayerRefundLeaf
+
+Executes a relayer refund leaf from a validated root bundle, sending tokens to relayers who filled deposits.
+
+```solidity
+function executeRelayerRefundLeaf(
+    uint32 rootBundleId,
+    RelayerRefundLeaf memory relayerRefundLeaf,
+    bytes32[] memory proof
+) public payable nonReentrant
+```
+
+<ParamField path="rootBundleId" type="uint32">
+  Index of root bundle in `rootBundles` array containing this leaf.
+</ParamField>
+
+<ParamField path="relayerRefundLeaf" type="RelayerRefundLeaf">
+  Leaf data for refunding relayers.
+  
+  **RelayerRefundLeaf struct:**
+  - `amountToReturn`: Amount to send back to HubPool (if pool rebalance was negative)
+  - `chainId`: Must match this chain's ID
+  - `refundAmounts`: Array of refund amounts per relayer
+  - `leafId`: Leaf identifier for bitmap
+  - `l2TokenAddress`: Token to distribute
+  - `refundAddresses`: Relayer addresses to refund (parallel to refundAmounts)
+</ParamField>
+
+<ParamField path="proof" type="bytes32[]">
+  Merkle inclusion proof for this leaf.
+</ParamField>
+
+**Requirements:**
+- `chainId` matches this chain
+- Valid merkle proof against `rootBundle.relayerRefundRoot`
+- Leaf not already claimed
+
+**Effects:**
+- Marks leaf as claimed in bitmap
+- Sends `amountToReturn` to `withdrawalRecipient` (HubPool)
+- Distributes refunds to relayers
+- If any refund transfer fails, credits `relayerRefund` mapping
+
+**Emits:** `ExecutedRelayerRefundRoot(amountToReturn, chainId, refundAmounts, rootBundleId, leafId, l2TokenAddress, refundAddresses, deferredRefunds, caller)`
+
+---
+
+### executeSlowRelayLeaf
+
+Executes a slow fill leaf from a validated root bundle, sending tokens from SpokePool reserves directly to the recipient.
+
+```solidity
+function executeSlowRelayLeaf(
+    V3SlowFill calldata slowFillLeaf,
+    uint32 rootBundleId,
+    bytes32[] calldata proof
+) public nonReentrant
+```
+
+<ParamField path="slowFillLeaf" type="V3SlowFill">
+  Slow fill parameters.
+  
+  **V3SlowFill struct:**
+  - `relayData`: Original deposit data (V3RelayData)
+  - `chainId`: Must match this chain
+  - `updatedOutputAmount`: Amount to send (can differ from relayData.outputAmount to adjust fee)
+</ParamField>
+
+<ParamField path="rootBundleId" type="uint32">
+  Index of root bundle containing this slow fill.
+</ParamField>
+
+<ParamField path="proof" type="bytes32[]">
+  Merkle inclusion proof.
+</ParamField>
+
+**Requirements:**
+- Valid merkle proof against `rootBundle.slowRelayRoot`
+- Relay not already filled
+- Sufficient SpokePool balance
+
+**Effects:**
+- Marks relay as filled (same as fast fill)
+- Sends `updatedOutputAmount` to recipient from SpokePool reserves
+- No relayer credited (repaymentChainId = 0, relayer = bytes32(0))
+
+**Emits:** `FilledRelay(..., fillType: SlowFill)`
+
+<Info>
+**Slow fills** are only possible when input and output tokens are "equivalent" (map to same L1 token via pool rebalance routes). They serve as a fallback when no relayer fills before the deadline.
+</Info>
+
+## Cross-Chain Admin Verification
+
+Each SpokePool implementation overrides `_requireAdminSender()` to verify cross-chain messages:
+
+<CodeGroup>
+```solidity Arbitrum
+// Uses address aliasing
+function _requireAdminSender() internal view override {
+    require(msg.sender == AddressAliasHelper.applyL1ToL2Alias(crossDomainAdmin));
+}
+```
+
+```solidity Optimism
+// Uses CrossDomainMessenger
+function _requireAdminSender() internal view override {
+    require(msg.sender == address(MESSENGER));
+    require(MESSENGER.xDomainMessageSender() == crossDomainAdmin);
+}
+```
+
+```solidity Polygon
+// Uses FxPortal
+function _requireAdminSender() internal view override {
+    require(msg.sender == FX_CHILD);
+    require(fxRootSender == crossDomainAdmin);
+}
+```
+</CodeGroup>
+
+## UUPS Upgradeable Pattern
+
+SpokePool uses OpenZeppelin's UUPS (Universal Upgradeable Proxy Standard) pattern:
+
+1. **Proxy Contract**: Holds all state and delegates calls to logic contract
+2. **Logic Contract**: Contains implementation (this contract)
+3. **Upgrade Authorization**: Only cross-domain admin (HubPool) can upgrade
+
+```solidity
+function _authorizeUpgrade(address newImplementation) internal override onlyAdmin {}
+```
+
+**Upgrade Flow:**
+1. HubPool calls `relaySpokePoolAdminFunction()` with upgrade calldata
+2. Message relayed via chain adapter to SpokePool
+3. SpokePool verifies sender via `_requireAdminSender()`
+4. Proxy upgrades to new logic contract
+
+## Events
+
+<ResponseField name="FundsDeposited" type="event">
+  Emitted when user deposits tokens for cross-chain transfer.
+  
+  ```solidity
+  event FundsDeposited(
+      bytes32 inputToken,
+      bytes32 outputToken,
+      uint256 inputAmount,
+      uint256 outputAmount,
+      uint256 indexed destinationChainId,
+      uint256 indexed depositId,
+      uint32 quoteTimestamp,
+      uint32 fillDeadline,
+      uint32 exclusivityDeadline,
+      bytes32 indexed depositor,
+      bytes32 recipient,
+      bytes32 exclusiveRelayer,
+      bytes message
+  )
+  ```
+</ResponseField>
+
+<ResponseField name="FilledRelay" type="event">
+  Emitted when relayer fills a deposit (or slow fill executed).
+  
+  ```solidity
+  event FilledRelay(
+      bytes32 inputToken,
+      bytes32 outputToken,
+      uint256 inputAmount,
+      uint256 outputAmount,
+      uint256 repaymentChainId,
+      uint256 indexed originChainId,
+      uint256 indexed depositId,
+      uint32 fillDeadline,
+      uint32 exclusivityDeadline,
+      bytes32 exclusiveRelayer,
+      bytes32 indexed relayer,
+      bytes32 depositor,
+      bytes32 recipient,
+      bytes32 messageHash,
+      V3RelayExecutionEventInfo relayExecutionInfo
+  )
+  ```
+  
+  **relayExecutionInfo.fillType:**
+  - `FastFill (0)`: Normal relayer fill
+  - `ReplacedSlowFill (1)`: Fast fill that replaced slow fill request (creates excess funds)
+  - `SlowFill (2)`: Executed via executeSlowRelayLeaf
+</ResponseField>
+
+<ResponseField name="RequestedSlowFill" type="event">
+  Emitted when slow fill is requested for a deposit.
+  
+  ```solidity
+  event RequestedSlowFill(
+      bytes32 inputToken,
+      bytes32 outputToken,
+      uint256 inputAmount,
+      uint256 outputAmount,
+      uint256 indexed originChainId,
+      uint256 indexed depositId,
+      uint32 fillDeadline,
+      uint32 exclusivityDeadline,
+      bytes32 exclusiveRelayer,
+      bytes32 depositor,
+      bytes32 recipient,
+      bytes32 messageHash
+  )
+  ```
+</ResponseField>
+
+<ResponseField name="ExecutedRelayerRefundRoot" type="event">
+  Emitted when relayer refund leaf is executed.
+  
+  ```solidity
+  event ExecutedRelayerRefundRoot(
+      uint256 amountToReturn,
+      uint256 indexed chainId,
+      uint256[] refundAmounts,
+      uint32 indexed rootBundleId,
+      uint32 indexed leafId,
+      address l2TokenAddress,
+      address[] refundAddresses,
+      bool deferredRefunds,
+      address caller
+  )
+  ```
+</ResponseField>
+
+<ResponseField name="RelayedRootBundle" type="event">
+  Emitted when HubPool relays new root bundle.
+  
+  ```solidity
+  event RelayedRootBundle(
+      uint32 indexed rootBundleId,
+      bytes32 indexed relayerRefundRoot,
+      bytes32 indexed slowRelayRoot
+  )
+  ```
+</ResponseField>
+
+## Admin Functions
+
+<AccordionGroup>
+  <Accordion title="pauseDeposits" icon="pause">
+    Pause/unpause deposit functions. Affects `deposit()` but not `speedUpDeposit()`.
+    
+    ```solidity
+    function pauseDeposits(bool pause) public onlyAdmin nonReentrant
+    ```
+  </Accordion>
+
+  <Accordion title="pauseFills" icon="pause">
+    Pause/unpause fill functions. Affects `fillRelay()` and variants.
+    
+    ```solidity
+    function pauseFills(bool pause) public onlyAdmin nonReentrant
+    ```
+  </Accordion>
+
+  <Accordion title="setCrossDomainAdmin" icon="user-shield">
+    Change cross-domain admin address (HubPool).
+    
+    ```solidity
+    function setCrossDomainAdmin(address newCrossDomainAdmin) public onlyAdmin nonReentrant
+    ```
+  </Accordion>
+
+  <Accordion title="setWithdrawalRecipient" icon="wallet">
+    Change withdrawal recipient (where returned funds go).
+    
+    ```solidity
+    function setWithdrawalRecipient(address newWithdrawalRecipient) public onlyAdmin nonReentrant
+    ```
+  </Accordion>
+
+  <Accordion title="relayRootBundle" icon="tree">
+    Store new root bundle from HubPool. Only callable by admin.
+    
+    ```solidity
+    function relayRootBundle(
+        bytes32 relayerRefundRoot,
+        bytes32 slowRelayRoot
+    ) public onlyAdmin nonReentrant
+    ```
+  </Accordion>
+
+  <Accordion title="emergencyDeleteRootBundle" icon="trash">
+    Delete bad root bundle in emergency.
+    
+    ```solidity
+    function emergencyDeleteRootBundle(uint256 rootBundleId) public onlyAdmin nonReentrant
+    ```
+    
+    <Warning>Deleting a struct with mapping doesn't delete the mapping data. Used only in emergencies.</Warning>
+  </Accordion>
+
+  <Accordion title="setOftMessenger" icon="message">
+    Configure OFT messenger for LayerZero token bridging.
+    
+    ```solidity
+    function setOftMessenger(
+        address token,
+        address messenger
+    ) external onlyAdmin nonReentrant
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Security Considerations
+
+<Warning>
+**Relay Hash Collisions:** Using `unsafeDeposit` with reused nonces can create duplicate deposit IDs, making deposits unfillable. Speed-up signatures can be replayed across deposits with same ID.
+</Warning>
+
+<Info>
+**Admin Verification:** Each chain implementation must correctly verify cross-chain admin messages to prevent unauthorized upgrades or config changes.
+</Info>
+
+- **Reentrancy Protection**: All state-changing functions use `nonReentrant` modifier
+- **Fill Status Tracking**: Prevents double-fills via `fillStatuses` mapping
+- **Deadline Validation**: Enforces quote timestamp and fill deadline buffers
+- **Native Token Handling**: Safely wraps/unwraps native tokens with balance checks
+- **Message Recipient**: Validates contract recipients implement `handleV3AcrossMessage()`
+- **Merkle Proofs**: All root bundle executions verify cryptographic proofs
+- **Claimed Bitmaps**: 2D bitmap prevents leaf re-execution
+
+## Deposit Variants
+
+<CardGroup cols={2}>
+  <Card title="deposit()" icon="coins">
+    Core deposit function using bytes32 types for cross-chain addresses.
+  </Card>
+  
+  <Card title="depositV3()" icon="backward">
+    Legacy-compatible version using `address` types instead of `bytes32`.
+  </Card>
+  
+  <Card title="depositNow()" icon="clock">
+    Sets `quoteTimestamp` to current time and fill deadline as offset. For multisigs with uncertain mine time.
+  </Card>
+  
+  <Card title="unsafeDeposit()" icon="warning">
+    Allows custom nonce instead of global counter. Risky - can create duplicate deposit IDs.
+  </Card>
+</CardGroup>
+
+## Fill Variants
+
+<CardGroup cols={2}>
+  <Card title="fillRelay()" icon="bolt">
+    Standard fill using original deposit parameters.
+  </Card>
+  
+  <Card title="fillRelayWithUpdatedDeposit()" icon="pen">
+    Fill using depositor-signed updated parameters (output amount, recipient, message).
+  </Card>
+  
+  <Card title="fillV3Relay()" icon="backward">
+    Legacy-compatible version using address types.
+  </Card>
+  
+  <Card title="fill()" icon="standard">
+    ERC-7683 standard fill function using order ID.
+  </Card>
+</CardGroup>
+
+## Related Contracts
+
+- [HubPool](/contracts/hubpool) - L1 contract that manages liquidity and validates root bundles
+- Chain-Specific Implementations:
+  - `Ethereum_SpokePool.sol`
+  - `Arbitrum_SpokePool.sol`
+  - `Optimism_SpokePool.sol`
+  - `Polygon_SpokePool.sol`
+  - And many more...

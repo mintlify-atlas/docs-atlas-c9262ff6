@@ -1,0 +1,357 @@
+---
+title: Hardhat Tests (Legacy)
+description: Guide to legacy Hardhat tests for Across Protocol smart contracts
+---
+
+<Warning>
+**Hardhat tests are legacy.** All new tests should be written in Foundry. This framework is maintained for existing test suites only.
+</Warning>
+
+## Overview
+
+Hardhat was the original testing framework for Across Protocol. The project is **actively migrating** to Foundry for better performance and developer experience.
+
+### Why Migrate from Hardhat?
+
+- **Slower execution**: JavaScript/TypeScript overhead vs native EVM execution
+- **Complex setup**: Requires compilation, typechain generation, and multiple dependencies
+- **Less gas-efficient**: No built-in gas profiling like Foundry
+- **Harder debugging**: Less granular trace information
+
+### Migration Status
+
+- **New tests**: Must be written in Foundry (see [Foundry Tests](/development/foundry))
+- **Existing tests**: Maintained in Hardhat until migration is complete
+- **CI**: Both Foundry and Hardhat tests run in continuous integration
+
+## Running Hardhat Tests
+
+### Basic Commands
+
+```bash
+# Run all Hardhat tests
+yarn test-evm-hardhat
+
+# Run with gas reporting
+yarn test:report-gas
+
+# Run directly with hardhat
+IS_TEST=true hardhat test
+
+# Run with gas reporter enabled
+IS_TEST=true REPORT_GAS=true hardhat test
+```
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|--------|
+| `IS_TEST` | Required for test builds | `true` (set in scripts) |
+| `REPORT_GAS` | Enable hardhat-gas-reporter | `false` |
+| `NODE_URL_1` | Ethereum mainnet RPC (for forks) | - |
+
+## Test Structure
+
+### Directory Layout
+
+```
+test/evm/hardhat/
+  constants.ts       # Shared test constants
+  MerkleLib.utils.ts # Utility functions for tests
+```
+
+Most legacy Hardhat tests have been migrated. Remaining files are utilities and constants.
+
+### Test File Pattern (Historical)
+
+```typescript
+import { expect } from "chai";
+import { ethers } from "hardhat";
+import { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers";
+
+let owner: SignerWithAddress;
+let user: SignerWithAddress;
+
+describe("MyContract", function () {
+  beforeEach(async function () {
+    [owner, user] = await ethers.getSigners();
+    // Deploy contracts
+  });
+
+  it("should handle deposits", async function () {
+    await myContract.connect(user).deposit(amount);
+    expect(await myContract.balanceOf(user.address)).to.equal(amount);
+  });
+});
+```
+
+## Configuration
+
+### hardhat.config.ts
+
+Hardhat configuration includes:
+
+- **Solidity compiler**: Version 0.8.30 with optimizations
+- **Networks**: Mainnet, Arbitrum, Optimism, Base, etc.
+- **Plugins**:
+  - `@nomiclabs/hardhat-ethers` - Ethers.js integration
+  - `@nomiclabs/hardhat-waffle` - Waffle testing
+  - `hardhat-gas-reporter` - Gas usage analysis
+  - `@typechain/hardhat` - TypeScript contract types
+
+### TypeChain
+
+Hardhat automatically generates TypeScript types for contracts:
+
+```bash
+# Generate typechain types
+yarn generate-evm-artifacts
+
+# Types are output to:
+typechain/
+```
+
+## Gas Reporting
+
+Hardhat includes gas reporting via `hardhat-gas-reporter`:
+
+```bash
+# Run tests with gas reporting
+yarn test:report-gas
+```
+
+Output shows:
+- Gas used per function call
+- Average gas consumption
+- Comparison against previous runs (if configured)
+
+### Sample Output
+
+```
+·----------------------------------------|---------------------------|-------------|----------------------------·
+|  Solc version: 0.8.30                  ·  Optimizer enabled: true  ·  Runs: 800  ·  Block limit: 30000000 gas  │
+·········································|···························|·············|·····························
+|  Methods                                                                                                        │
+··················|······················|·············|·············|·············|··············|···············
+|  Contract       ·  Method              ·  Min        ·  Max        ·  Avg        ·  # calls     ·  usd (avg)   │
+··················|······················|·············|·············|·············|··············|···············
+|  SpokePool      ·  deposit             ·      95000  ·     120000  ·     107500  ·          15  ·       -      │
+·····················································|·············|·············|··············|···············
+```
+
+## Common Patterns
+
+### Mock Contracts with Smock
+
+Hardhat tests use `@defi-wonderland/smock` for mocking:
+
+```typescript
+import { smock, FakeContract } from "@defi-wonderland/smock";
+
+let mockToken: FakeContract<IERC20>;
+
+beforeEach(async function () {
+  mockToken = await smock.fake<IERC20>("IERC20");
+  mockToken.balanceOf.returns(ethers.utils.parseEther("100"));
+});
+```
+
+<Tip>
+**In Foundry, use `vm.mockCall` instead** (see [Foundry Tests](/development/foundry) for examples).
+</Tip>
+
+### Time Manipulation
+
+```typescript
+import { ethers } from "hardhat";
+
+// Increase time by 1 hour
+await ethers.provider.send("evm_increaseTime", [3600]);
+await ethers.provider.send("evm_mine", []);
+
+// Set specific timestamp
+await ethers.provider.send("evm_setNextBlockTimestamp", [timestamp]);
+await ethers.provider.send("evm_mine", []);
+```
+
+Foundry equivalent:
+```solidity
+vm.warp(block.timestamp + 3600);  // Increase by 1 hour
+vm.warp(timestamp);                // Set specific timestamp
+```
+
+### Event Testing
+
+```typescript
+import { expect } from "chai";
+
+await expect(myContract.deposit(amount))
+  .to.emit(myContract, "Deposited")
+  .withArgs(user.address, amount);
+```
+
+Foundry equivalent:
+```solidity
+vm.expectEmit(address(myContract));
+emit Deposited(user, amount);
+myContract.deposit(amount);
+```
+
+## Differences from Foundry
+
+| Feature | Hardhat | Foundry |
+|---------|---------|--------|
+| **Language** | TypeScript/JavaScript | Solidity |
+| **Execution** | EVM via ethers.js | Native EVM (fast) |
+| **Mocking** | Smock library | `vm.mockCall` |
+| **Time travel** | `evm_increaseTime` | `vm.warp` |
+| **Events** | Chai matchers | `vm.expectEmit` |
+| **Fuzzing** | Manual with loops | Built-in fuzzing |
+| **Gas profiling** | hardhat-gas-reporter | `forge snapshot` |
+| **Performance** | Slower (~minutes) | Faster (~seconds) |
+
+## When to Use Hardhat
+
+<Warning>
+**Only use Hardhat for**:
+- Maintaining existing test suites
+- Integration tests with complex JavaScript logic
+- Tests that require npm packages not available in Solidity
+
+**Do NOT use Hardhat for**:
+- New unit tests (use Foundry)
+- Gas-sensitive tests (use Foundry)
+- Simple contract interactions (use Foundry)
+</Warning>
+
+## Migration Guide
+
+To migrate a Hardhat test to Foundry:
+
+1. **Convert setup** from `beforeEach` to `setUp()`
+2. **Replace ethers.js calls** with native Solidity
+3. **Convert mocks** from Smock to `vm.mockCall`
+4. **Update assertions** from Chai to Forge assertions
+5. **Move file** to `test/evm/foundry/local/`
+
+### Example Migration
+
+**Before (Hardhat):**
+```typescript
+import { expect } from "chai";
+
+describe("HubPool", function () {
+  beforeEach(async function () {
+    [owner] = await ethers.getSigners();
+    hubPool = await ethers.getContract("HubPool");
+  });
+
+  it("should enable token", async function () {
+    await hubPool.enableL1TokenForLiquidityProvision(token.address);
+    const pooledToken = await hubPool.pooledTokens(token.address);
+    expect(pooledToken.isEnabled).to.be.true;
+  });
+});
+```
+
+**After (Foundry):**
+```solidity
+import { Test } from "forge-std/Test.sol";
+
+contract HubPool_AdminTest is Test {
+    HubPool hubPool;
+    address owner;
+    address token;
+
+    function setUp() public {
+        owner = makeAddr("owner");
+        vm.prank(owner);
+        hubPool = new HubPool(...);
+        token = makeAddr("token");
+    }
+
+    function test_EnableToken() public {
+        hubPool.enableL1TokenForLiquidityProvision(token);
+        (, bool isEnabled, , , , ) = hubPool.pooledTokens(token);
+        assertTrue(isEnabled);
+    }
+}
+```
+
+## Build Commands
+
+### Compile Contracts
+
+```bash
+# Compile all contracts
+yarn build-hardhat
+
+# Clean build artifacts
+yarn clean
+
+# Fast clean (moves dirs to background delete)
+yarn clean-fast
+```
+
+### Generate Artifacts
+
+```bash
+# Generate TypeChain types
+yarn generate-evm-artifacts
+
+# Export deployment addresses
+yarn process-hardhat-export
+```
+
+## Troubleshooting
+
+### "Cannot find module" errors
+
+```bash
+# Regenerate typechain
+yarn generate-evm-artifacts
+```
+
+### Out of memory
+
+```bash
+# Increase Node.js memory limit
+export NODE_OPTIONS="--max-old-space-size=4096"
+yarn test-evm-hardhat
+```
+
+### Slow test execution
+
+```bash
+# Run specific test file
+npx hardhat test test/evm/hardhat/MyTest.ts
+
+# Or consider migrating to Foundry
+```
+
+## Available Scripts
+
+From `package.json`:
+
+| Script | Description |
+|--------|-------------|
+| `yarn build-hardhat` | Compile contracts with Hardhat |
+| `yarn test-evm-hardhat` | Run Hardhat tests |
+| `yarn test:report-gas` | Run tests with gas reporting |
+| `yarn generate-evm-artifacts` | Generate TypeChain types |
+| `yarn process-hardhat-export` | Export deployment addresses |
+
+## Next Steps
+
+<Warning>
+**Migrate to Foundry** for all new tests. See the [Foundry Tests](/development/foundry) guide.
+</Warning>
+
+<CardGroup cols={2}>
+  <Card title="Foundry Tests" icon="flask" href="/development/foundry">
+    Learn the modern testing framework
+  </Card>
+  <Card title="Testing Overview" icon="vial" href="/development/testing">
+    Return to testing overview
+  </Card>
+</CardGroup>

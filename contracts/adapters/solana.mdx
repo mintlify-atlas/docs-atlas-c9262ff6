@@ -1,0 +1,480 @@
+---
+title: Solana Adapter
+description: Bridge USDC to Solana via Circle CCTP
+---
+
+## Overview
+
+The `Solana_Adapter` enables the HubPool to bridge USDC from Ethereum to Solana using Circle's Cross-Chain Transfer Protocol (CCTP). This is the first and only adapter in Across Protocol that bridges to a non-EVM chain.
+
+## Key Features
+
+- **CCTP-Only**: Exclusively uses Circle CCTP for USDC transfers
+- **SVM Integration**: First cross-chain adapter for Solana Virtual Machine
+- **Address Conversion**: Maps Solana's 32-byte addresses to EVM 20-byte format
+- **Restricted Target**: Only allows bridging to Solana SpokePool
+- **Message Support**: Can send arbitrary messages via CCTP MessageTransmitter
+
+## Contract Reference
+
+**Location**: `contracts/chain-adapters/Solana_Adapter.sol`
+
+### Constructor
+
+```solidity
+constructor(
+    IERC20 _l1Usdc,
+    ITokenMessenger _cctpTokenMessenger,
+    IMessageTransmitter _cctpMessageTransmitter,
+    bytes32 solanaSpokePool,
+    bytes32 solanaUsdc,
+    bytes32 solanaSpokePoolUsdcVault
+)
+```
+
+**Parameters**:
+- `_l1Usdc` - USDC token address on Ethereum (0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48)
+- `_cctpTokenMessenger` - Circle CCTP TokenMessenger contract
+- `_cctpMessageTransmitter` - Circle CCTP MessageTransmitter contract
+- `solanaSpokePool` - Solana SpokePool program address (Base58 decoded to bytes32)
+- `solanaUsdc` - USDC mint address on Solana (Base58 decoded to bytes32)
+- `solanaSpokePoolUsdcVault` - Solana SpokePool's USDC ATA (Associated Token Account)
+
+**Constructor Validations**:
+```solidity
+if (address(_cctpTokenMessenger) == address(0)) {
+    revert InvalidCctpTokenMessenger(address(_cctpTokenMessenger));
+}
+if (address(_cctpMessageTransmitter) == address(0)) {
+    revert InvalidCctpMessageTransmitter(address(_cctpMessageTransmitter));
+}
+```
+
+Both CCTP contracts are required for Solana adapter to function.
+
+### Immutable Variables
+
+```solidity
+// Circle CCTP contracts
+IMessageTransmitter public immutable cctpMessageTransmitter;
+
+// Solana addresses (as bytes32)
+bytes32 public immutable SOLANA_SPOKE_POOL_BYTES32;
+bytes32 public immutable SOLANA_SPOKE_POOL_USDC_VAULT;
+
+// EVM address representations (derived from bytes32)
+address public immutable SOLANA_SPOKE_POOL_ADDRESS;
+address public immutable SOLANA_USDC_ADDRESS;
+```
+
+## Address Conversion
+
+### Solana to EVM Mapping
+
+Solana uses 32-byte addresses (Base58 encoded), while EVM uses 20-byte addresses. The adapter uses the `Bytes32ToAddress` library to convert:
+
+```solidity
+using Bytes32ToAddress for bytes32;
+
+// In constructor
+SOLANA_SPOKE_POOL_ADDRESS = solanaSpokePool.toAddressUnchecked();
+SOLANA_USDC_ADDRESS = solanaUsdc.toAddressUnchecked();
+```
+
+**Conversion Logic**: Truncates the bytes32 address to its lowest 20 bytes:
+
+```solidity
+library Bytes32ToAddress {
+    function toAddressUnchecked(bytes32 b) internal pure returns (address) {
+        return address(uint160(uint256(b)));
+    }
+}
+```
+
+**Example**:
+```
+Solana Address (Base58): 5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d
+Solana Address (bytes32): 0x0406a99b...3d6e8a13
+EVM Address (address):    0x...b3d6e8a13 (lowest 20 bytes)
+```
+
+**Important**: The HubPool owner must use this same conversion when:
+- Setting Solana spoke pool in `setCrossChainContracts()`
+- Configuring pool rebalance routes
+- Setting deposit routes
+
+## Core Functions
+
+### relayMessage()
+
+Sends arbitrary messages to Solana SpokePool via CCTP MessageTransmitter.
+
+```solidity
+function relayMessage(address target, bytes calldata message) external payable override {
+    if (target != SOLANA_SPOKE_POOL_ADDRESS) {
+        revert InvalidRelayMessageTarget(target);
+    }
+    
+    cctpMessageTransmitter.sendMessage(
+        CircleDomainIds.Solana,  // destinationDomain = 5
+        SOLANA_SPOKE_POOL_BYTES32,  // recipient (bytes32)
+        message  // messageBody
+    );
+
+    emit MessageRelayed(target, message);
+}
+```
+
+**Restrictions**:
+- Target MUST be the Solana SpokePool address (EVM representation)
+- Uses CCTP's `sendMessage()`, not `depositForBurn()`
+
+**How it works**:
+1. MessageTransmitter emits `MessageSent` event on Ethereum
+2. Circle attestation service signs the message
+3. Relayer submits message + attestation to Solana
+4. Solana SpokePool program receives and processes message
+
+### relayTokens()
+
+Bridges USDC from Ethereum to Solana SpokePool's USDC vault.
+
+```solidity
+function relayTokens(
+    address l1Token,
+    address l2Token,
+    uint256 amount,
+    address to
+) external payable override {
+    // Validate all parameters
+    if (l1Token != address(usdcToken)) {
+        revert InvalidL1Token(l1Token);
+    }
+    if (l2Token != SOLANA_USDC_ADDRESS) {
+        revert InvalidL2Token(l2Token);
+    }
+    if (amount > type(uint64).max) {
+        revert InvalidAmount(amount);
+    }
+    if (to != SOLANA_SPOKE_POOL_ADDRESS) {
+        revert InvalidTokenRecipient(to);
+    }
+
+    // Transfer USDC to Solana vault via CCTP
+    _transferUsdc(SOLANA_SPOKE_POOL_USDC_VAULT, amount);
+
+    emit TokensRelayed(l1Token, l2Token, amount, to);
+}
+```
+
+**Validations**:
+1. **L1 token**: Must be USDC
+2. **L2 token**: Must be Solana USDC (EVM representation)
+3. **Amount**: Must fit in uint64 (Solana limitation)
+4. **Recipient**: Must be Solana SpokePool (EVM representation)
+
+**Recipient Distinction**:
+- `to` parameter: SpokePool program address (validated but not used)
+- Actual recipient: `SOLANA_SPOKE_POOL_USDC_VAULT` (SpokePool's USDC ATA)
+
+This is because Solana uses Associated Token Accounts (ATAs) to hold SPL tokens, not the program address itself.
+
+### _transferUsdc()
+
+Inherited from `CircleCCTPAdapter`, handles CCTP bridging:
+
+```solidity
+function _transferUsdc(bytes32 recipient, uint256 amount) internal {
+    usdcToken.safeIncreaseAllowance(address(cctpTokenMessenger), amount);
+    
+    cctpTokenMessenger.depositForBurn(
+        amount,
+        CircleDomainIds.Solana,  // destinationDomain = 5
+        recipient,  // mintRecipient (bytes32)
+        address(usdcToken)  // burnToken
+    );
+}
+```
+
+**Note**: The Solana adapter overloads `_transferUsdc()` to accept `bytes32` recipient instead of `address`.
+
+## Circle CCTP Integration
+
+### CCTP Contracts
+
+**TokenMessenger** (Ethereum mainnet):
+- Address: `0xBd3fa81B58Ba92a82136038B25aDec7066af3155`
+- Used for: `depositForBurn()` to bridge USDC
+
+**MessageTransmitter** (Ethereum mainnet):
+- Address: `0x0a992d191DEeC32aFe36203Ad87D7d289a738F81`
+- Used for: `sendMessage()` to send arbitrary messages
+
+### Circle Domain IDs
+
+```solidity
+library CircleDomainIds {
+    uint32 public constant Ethereum = 0;
+    uint32 public constant Optimism = 2;
+    uint32 public constant Arbitrum = 3;
+    uint32 public constant Solana = 5;
+    uint32 public constant Polygon = 7;
+    // ...
+}
+```
+
+**Solana Domain ID**: 5
+
+### CCTP Message Flow
+
+1. **Ethereum**: `TokenMessenger.depositForBurn()` burns USDC and emits event
+2. **Circle Attestation**: Circle's attestation service signs the burn event
+3. **Relayer**: Fetches attestation and submits to Solana
+4. **Solana**: CCTP program verifies attestation and mints USDC to recipient ATA
+
+**Finality Time**: 10-20 minutes (depends on attestation service)
+
+## Solana-Specific Concepts
+
+### Associated Token Accounts (ATAs)
+
+In Solana, programs (smart contracts) don't hold tokens directly. Instead, each program has an Associated Token Account for each SPL token:
+
+```
+Program Address: 5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d
+USDC Mint:       EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+Program USDC ATA: <derived address> (stored in SOLANA_SPOKE_POOL_USDC_VAULT)
+```
+
+**Why this matters**: When bridging USDC, the recipient is the SpokePool's USDC ATA, not the program address.
+
+### Base58 Encoding
+
+Solana addresses are displayed in Base58 encoding:
+
+```
+Base58: 5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d
+Hex:    0x406a99b31aae59e091364f9e7d12f0a4c6d88ff1e2c8ad3d6e8a13
+Bytes:  [0x40, 0x6a, 0x99, ...]
+```
+
+The adapter constructor accepts these addresses as `bytes32` (hex decoded from Base58).
+
+### Program vs Account
+
+In Solana terminology:
+- **Program**: Smart contract logic (like Solana SpokePool)
+- **Account**: State storage (like USDC balance in ATA)
+
+The adapter bridges to the **account** (ATA) but validates the **program** address (SpokePool).
+
+## Limitations
+
+### USDC Only
+
+Unlike other adapters, Solana adapter ONLY supports USDC:
+
+```solidity
+if (l1Token != address(usdcToken)) {
+    revert InvalidL1Token(l1Token);
+}
+```
+
+Other tokens cannot be bridged using this adapter.
+
+### Solana SpokePool Only
+
+Both `relayMessage()` and `relayTokens()` restrict the target:
+
+```solidity
+if (to != SOLANA_SPOKE_POOL_ADDRESS) {
+    revert InvalidTokenRecipient(to);
+}
+```
+
+This is a security measure to prevent misuse of the adapter.
+
+### Amount Limit
+
+Solana uses uint64 for token amounts (not uint256):
+
+```solidity
+if (amount > type(uint64).max) {
+    revert InvalidAmount(amount);
+}
+```
+
+**Max USDC per transaction**: ~18.4 quintillion USDC (18.4 × 10¹⁸, or type(uint64).max)
+
+This is not a practical limitation for USDC transfers.
+
+## Examples
+
+### Send Admin Message to Solana SpokePool
+
+```solidity
+// On HubPool
+bytes memory functionData = abi.encodeCall(
+    SpokePool.setEnableRoute,
+    (originToken, destinationChainId, enabled)
+);
+
+hubPool.relaySpokePoolAdminFunction(
+    1399811149,  // Solana chain ID
+    functionData
+);
+
+// Internally calls:
+// Solana_Adapter.relayMessage(solanaSpokePoolAddress, functionData)
+// -> cctpMessageTransmitter.sendMessage(5, SOLANA_SPOKE_POOL_BYTES32, functionData)
+```
+
+### Bridge USDC to Solana
+
+```solidity
+// Bridge 10,000 USDC to Solana SpokePool
+hubPool.relayTokens(
+    USDC_L1,  // 0xA0b8699...eB48
+    USDC_SOLANA,  // EVM representation of Solana USDC mint
+    10000e6,  // 10,000 USDC
+    SOLANA_SPOKE_POOL_ADDRESS  // EVM representation of SpokePool program
+);
+
+// Internally:
+// 1. Validates all parameters
+// 2. Approves USDC to TokenMessenger
+// 3. Calls TokenMessenger.depositForBurn(
+//      10000e6,
+//      5,  // Solana domain
+//      SOLANA_SPOKE_POOL_USDC_VAULT,  // bytes32 recipient ATA
+//      USDC_L1
+//    )
+```
+
+### Derive Solana Addresses for Constructor
+
+```javascript
+// Using @solana/web3.js
+const { PublicKey } = require('@solana/web3.js');
+const bs58 = require('bs58');
+
+// Solana SpokePool program address
+const spokePool = new PublicKey('5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d');
+const spokePoolBytes32 = '0x' + Buffer.from(spokePool.toBytes()).toString('hex').padStart(64, '0');
+
+// USDC mint address
+const usdcMint = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+const usdcBytes32 = '0x' + Buffer.from(usdcMint.toBytes()).toString('hex').padStart(64, '0');
+
+// SpokePool's USDC ATA (Associated Token Account)
+const ata = await getAssociatedTokenAddress(usdcMint, spokePool);
+const ataBytes32 = '0x' + Buffer.from(ata.toBytes()).toString('hex').padStart(64, '0');
+
+console.log('Constructor args:');
+console.log('solanaSpokePool:', spokePoolBytes32);
+console.log('solanaUsdc:', usdcBytes32);
+console.log('solanaSpokePoolUsdcVault:', ataBytes32);
+```
+
+## Security Considerations
+
+### Address Validation
+
+The adapter strictly validates all addresses:
+
+```solidity
+if (target != SOLANA_SPOKE_POOL_ADDRESS) revert InvalidRelayMessageTarget(target);
+if (l1Token != address(usdcToken)) revert InvalidL1Token(l1Token);
+if (l2Token != SOLANA_USDC_ADDRESS) revert InvalidL2Token(l2Token);
+if (to != SOLANA_SPOKE_POOL_ADDRESS) revert InvalidTokenRecipient(to);
+```
+
+This prevents:
+- Bridging to arbitrary Solana addresses
+- Bridging tokens other than USDC
+- Sending messages to unauthorized recipients
+
+### CCTP Trust Assumptions
+
+The adapter relies on Circle's CCTP infrastructure:
+
+- Circle's attestation service must be available and honest
+- Circle can pause CCTP contracts (emergency stop)
+- USDC mint authority on Solana controlled by Circle
+
+### Amount Overflow Protection
+
+```solidity
+if (amount > type(uint64).max) {
+    revert InvalidAmount(amount);
+}
+```
+
+Prevents overflow when casting uint256 to Solana's uint64 token amounts.
+
+## Admin Verification on Solana
+
+The Solana SpokePool program validates admin messages:
+
+```rust
+// Pseudo-Rust code
+fn process_message_from_root(ctx: Context, message: Vec<u8>) -> Result<()> {
+    // Verify message came from CCTP MessageTransmitter
+    require!(ctx.accounts.message_transmitter.key() == CCTP_MESSAGE_TRANSMITTER);
+    
+    // Verify source domain is Ethereum (domain 0)
+    require!(message.source_domain == 0);
+    
+    // Verify sender is HubPool (bytes32 representation)
+    require!(message.sender == HUB_POOL_BYTES32);
+    
+    // Execute admin function
+    invoke_admin_function(message.message_body)?;
+    
+    Ok(())
+}
+```
+
+## Gas and Fees
+
+### Ethereum L1 Gas
+
+Typical gas costs:
+
+| Operation | Estimated Gas |
+|-----------|---------------|
+| relayMessage | ~100,000 |
+| relayTokens | ~120,000 |
+
+### Circle CCTP Fees
+
+CCTP does not charge bridging fees (as of 2024). The only costs are:
+
+- Ethereum L1 gas for `depositForBurn()`
+- Solana transaction fees for attestation submission (paid by relayer)
+
+### Solana Transaction Fees
+
+Solana has very low transaction fees (~0.000005 SOL per signature). The relayer pays for:
+
+- Submitting CCTP attestation
+- Executing message on SpokePool program
+
+## Related Contracts
+
+- `Solana_SpokePool` (Rust program) - Receives CCTP messages and processes admin functions
+- `CircleCCTPAdapter.sol` - Base library for CCTP integration
+- `Bytes32ToAddress.sol` - Library for Solana address conversion
+- `AdapterInterface.sol` - Common interface for all chain adapters
+
+## External References
+
+- [Circle CCTP Documentation](https://developers.circle.com/stablecoins/docs/cctp-getting-started)
+- [CCTP Solana Integration](https://developers.circle.com/stablecoins/docs/cctp-solana-integration)
+- [Solana Program Documentation](https://docs.solana.com/developing/programming-model/overview)
+- [SPL Token Program](https://spl.solana.com/token)
+- [Associated Token Account Program](https://spl.solana.com/associated-token-account)
+
+## Source Code
+
+[View on GitHub](https://github.com/across-protocol/contracts/blob/master/contracts/chain-adapters/Solana_Adapter.sol)
